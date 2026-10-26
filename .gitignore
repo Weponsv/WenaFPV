@@ -21,3 +21,6 @@ pkg/
 *.pkg.tar.zst
 *.pkg.tar.xz
 src.zip
+
+# AI helper files (personal reference, not for repo)
+GIT_UPLOAD_AI_HELP.md
