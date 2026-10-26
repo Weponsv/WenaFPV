@@ -1,0 +1,23 @@
+# Build artifacts
+wenafpv
+tests/physics_test
+
+# Config (local user config, not the default)
+# ~/.config/wenafpv/config.ini is user-specific, don't track
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Debug output
+*.ppm
+*.log
+
+# Package build artifacts
+pkg/
+*.pkg.tar.zst
+*.pkg.tar.xz
+src.zip
