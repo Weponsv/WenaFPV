@@ -187,8 +187,7 @@ WenaFPV/
 ├── Makefile
 ├── README.md
 ├── UPDATES.md
-├── RESUME_FOR_AI.md
-└── wenafpv           # Built executable (after make)
+└── RESUME_FOR_AI.md  # If you want to work on it by yourself tell AI to read this
 ```
 
 ---
