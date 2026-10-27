@@ -44,7 +44,7 @@ WenaFPV is a 5-inch FPV freestyle drone simulator built for **low-end hardware**
 | **Gate Training** | Progressive 8-gate line with varying sizes |
 | **Slalom Training** | S-bend gates with marker poles |
 | **3.5" Tech Park** | Compact 100×100 m arena: channels, rails, willows, playground, skate bowl, pipe rack, scaffolds |
-| **Abandoned Base** | Ruined industrial/military base (~120×120 m) with 5 zones: Speed, Aim, Reaction, Notice, Outdoor |
+| **Abandoned Base** | Ruined industrial/military base (~120×120 m) |
 
 ### Analog Video Effects (NTSC-style)
 Distance loss, occlusion, multipath, low-battery interference, high-speed breakup, rolling sync bar, chromatic aberration, horizontal tear, frame freeze/dropout, dot-crawl, sync loss, color burst loss, ghost image.
@@ -245,7 +245,7 @@ MIT License — see [LICENSE](LICENSE) for details.
 - [ ] Race tracks, lap timing, replays
 - [ ] Physics tuning against real motor/prop/airframe data
 - [ ] Texture randomization z-fighting on coplanar surfaces (detail props on floors/walls)
-- [ ] Windows/macOS build instructions (currently Linux-only)
+- [ ] Windows build coming soon (currently Linux-only)
 
 ---
 
