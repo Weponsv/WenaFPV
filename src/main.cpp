@@ -20,6 +20,16 @@
 using namespace fpv;
 
 // ============================================================ GL loader
+// Define missing PFN types for texture functions (core OpenGL 1.1+)
+typedef void (APIENTRYP PFNGLGENTEXTURESPROC) (GLsizei n, GLuint *textures);
+typedef void (APIENTRYP PFNGLBINDTEXTUREPROC) (GLenum target, GLuint texture);
+typedef void (APIENTRYP PFNGLTEXIMAGE2DPROC) (GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels);
+typedef void (APIENTRYP PFNGLTEXPARAMETERIPROC) (GLenum target, GLenum pname, GLint param);
+typedef void (APIENTRYP PFNGLDELETETEXTURESPROC) (GLsizei n, const GLuint *textures);
+typedef void (APIENTRYP PFNGLDELETEFRAMEBUFFERSPROC) (GLsizei n, const GLuint *framebuffers);
+typedef void (APIENTRYP PFNGLDELETERENDERBUFFERSPROC) (GLsizei n, const GLuint *renderbuffers);
+typedef void (APIENTRYP PFNGLDELETEPROGRAMPROC) (GLuint program);
+
 #define GLFUNCS(X)                                                        \
     X(PFNGLCREATESHADERPROC, glCreateShader)                              \
     X(PFNGLSHADERSOURCEPROC, glShaderSource)                              \
@@ -56,7 +66,15 @@ using namespace fpv;
     X(PFNGLRENDERBUFFERSTORAGEPROC, glRenderbufferStorage)                \
     X(PFNGLRENDERBUFFERSTORAGEMULTISAMPLEPROC, glRenderbufferStorageMultisample) \
     X(PFNGLBLITFRAMEBUFFERPROC, glBlitFramebuffer)                        \
-    X(PFNGLFRAMEBUFFERRENDERBUFFERPROC, glFramebufferRenderbuffer)
+    X(PFNGLFRAMEBUFFERRENDERBUFFERPROC, glFramebufferRenderbuffer)        \
+    X(PFNGLGENTEXTURESPROC, glGenTextures)                                \
+    X(PFNGLBINDTEXTUREPROC, glBindTexture)                                \
+    X(PFNGLTEXIMAGE2DPROC, glTexImage2D)                                  \
+    X(PFNGLTEXPARAMETERIPROC, glTexParameteri)                            \
+    X(PFNGLDELETETEXTURESPROC, glDeleteTextures)                          \
+    X(PFNGLDELETEFRAMEBUFFERSPROC, glDeleteFramebuffers)                  \
+    X(PFNGLDELETERENDERBUFFERSPROC, glDeleteRenderbuffers)                \
+    X(PFNGLDELETEPROGRAMPROC, glDeleteProgram)
 
 struct GLF {
 #define X(T, N) T N = nullptr;
@@ -259,6 +277,134 @@ void main(){ gl_Position = uShadowVP * vec4(aPos, 1.0); }
 )";
 static const char* SHADOW_FS = R"(#version 330 core
 void main(){}
+)";
+
+// Planar drone shadow shader - projects drone shape onto ground plane
+static const char* DRONE_SHADOW_VS = R"(#version 330 core
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNrm;
+layout(location=2) in vec3 aCol;
+layout(location=3) in float aMat;
+uniform mat4 uVP;
+uniform mat4 uModel;
+uniform vec3 uSunDir;
+uniform float uShadowHeight;
+uniform vec3 uPlaneNormal;
+out float vFade;
+void main(){
+    vec3 worldPos = (uModel * vec4(aPos, 1.0)).xyz;
+    // Project onto plane along sun direction
+    float denom = dot(uSunDir, uPlaneNormal);
+    float t = (uShadowHeight - dot(worldPos, uPlaneNormal)) / denom;
+    vec3 shadowPos = worldPos + uSunDir * t;
+    // Fade based on height above plane
+    float height = dot(worldPos, uPlaneNormal) - uShadowHeight;
+    vFade = 1.0 - smoothstep(0.0, 20.0, height);
+    gl_Position = uVP * vec4(shadowPos, 1.0);
+}
+)";
+
+static const char* DRONE_SHADOW_FS = R"(#version 330 core
+in float vFade;
+out vec4 oColor;
+void main(){
+    // Dark semi-transparent shadow (40% black), faded by height
+    float alpha = 0.4 * vFade;
+    oColor = vec4(0.0, 0.0, 0.0, alpha);
+}
+)";
+
+// Propeller overlay shader - renders spinning props in FPV view with motion blur
+static const char* PROP_OVERLAY_VS = R"(#version 330 core
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNrm;
+layout(location=2) in vec3 aCol;
+layout(location=3) in float aMat;
+layout(location=4) in float aPropIdx;
+uniform mat4 uVP;
+uniform mat4 uView;
+uniform float uTime;
+uniform float uRPM[4];
+uniform float uOpacity;
+uniform int uBlades;
+uniform vec3 uSunDir;
+out vec3 vWorld;
+out vec3 vNrm;
+out vec3 vCol;
+out float vPropIdx;
+out float vRPM;
+out float vBlades;
+void main(){
+    vWorld = aPos;
+    vNrm = aNrm;
+    vCol = aCol;
+    vPropIdx = aPropIdx;
+    vRPM = uRPM[int(aPropIdx + 0.5)];
+    vBlades = float(uBlades);
+    
+    vec3 pos = aPos;
+    // Spin propellers (indices 0-3)
+    if (aPropIdx >= 0.0 && aPropIdx <= 3.0) {
+        float rpm = uRPM[int(aPropIdx + 0.5)];
+        // Alternate direction: 0,3 = CW; 1,2 = CCW (or vice versa)
+        float dir = (aPropIdx == 0.0 || aPropIdx == 3.0) ? 1.0 : -1.0;
+        float angle = rpm * (2.0 * 3.14159 / 60.0) * uTime * dir;
+        // Rotate around Y axis
+        float ca = cos(angle);
+        float sa = sin(angle);
+        pos = vec3(pos.x * ca + pos.z * sa, pos.y, -pos.x * sa + pos.z * ca);
+    }
+    // Apply view transform (camera tilt, no translation)
+    vec4 viewPos = uView * vec4(pos, 1.0);
+    gl_Position = uVP * viewPos;
+}
+)";
+
+static const char* PROP_OVERLAY_FS = R"(#version 330 core
+in vec3 vWorld;
+in vec3 vNrm;
+in vec3 vCol;
+in float vPropIdx;
+in float vRPM;
+in float vBlades;
+uniform float uOpacity;
+uniform vec3 uSunDir;
+uniform float uTime;
+out vec4 oColor;
+void main(){
+    vec3 n = normalize(vNrm);
+    vec3 col = vCol;
+    
+    // Calculate lighting
+    float diff = max(dot(n, uSunDir), 0.0);
+    float amb = 0.3;
+    col = col * (amb + diff * 0.7);
+    
+    // Propeller motion blur: at high RPM, fade blades and show disc
+    float maxRPM = 30000.0;
+    float rpmNorm = clamp(vRPM / maxRPM, 0.0, 1.0);
+    
+    // Alpha: blades fade out, disc fades in
+    float bladeAlpha = 1.0 - smoothstep(0.3, 0.8, rpmNorm);
+    float discAlpha = smoothstep(0.3, 0.8, rpmNorm);
+    
+    // Determine if this is a blade or hub/disc based on propIdx
+    // propIdx 0-3 = propellers, 4 = motors, 5 = front arms
+    float alpha;
+    if (vPropIdx >= 0.0 && vPropIdx <= 3.0) {
+        // Propeller: blend between blades and disc
+        // Use a subtle wobble on disc brightness at high RPM
+        float wobble = 1.0 + 0.05 * sin(uTime * vRPM * 0.001 * vBlades) * discAlpha;
+        // Increased disc alpha from 0.3 to 0.5 for better visibility
+        alpha = bladeAlpha * wobble + discAlpha * 0.5 * wobble;
+    } else {
+        // Motors and arms: fully opaque
+        alpha = 1.0;
+    }
+    
+    alpha *= uOpacity / 100.0;
+    oColor = vec4(col, alpha);
+}
 )";
 
 static const char* SKY_VS = R"(#version 330 core
@@ -547,6 +693,154 @@ in vec4 vCol; out vec4 oColor;
 void main(){ oColor = vCol; }
 )";
 
+// ============================================================ Draw Order Logging
+static void print_draw_order() {
+    std::printf("\n=== DRAW ORDER (one frame) ===\n");
+    std::printf("1. Shadow depth pass -> shadowFbo (shadowVP)\n");
+    std::printf("2. Camera view -> sceneFbo:\n");
+    std::printf("   2a. Sky pass (progSky, vaoSky, fullscreen triangle)\n");
+    std::printf("   2b. World pass (progWorld, vaoWorld, VP matrix)\n");
+    std::printf("   2c. Traffic cars (progWorld, vaoTraffic, VP matrix)\n");
+    std::printf("   2d. Drone planar shadow (progDroneShadow, vaoDrone, VP matrix, stencil)\n");
+    std::printf("   2e. Propeller overlay (progPropOverlay, vaoPropOverlay, P_overlay+view, blend, no cull)\n");
+    std::printf("3. MSAA resolve (sceneFbo -> resolveFbo) if MSAA > 1\n");
+    std::printf("4. Video post-process -> default framebuffer (progVideo, vaoSky, sceneColor texture)\n");
+    std::printf("5. OSD/UI -> default framebuffer (progOsd, vaoOsd, orthographic uRes)\n");
+    std::printf("   5a. Battery, altitude, speed, timer, ARMED status\n");
+    std::printf("   5b. Settings menu (if open)\n");
+    std::printf("6. Swap buffers\n");
+    std::printf("=== END DRAW ORDER ===\n\n");
+}
+
+// ============================================================ GL State Diagnostic
+static void dump_gl_state(const char* label) {
+    int viewport[4];
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    
+    int scissor[4];
+    glGetIntegerv(GL_SCISSOR_BOX, scissor);
+    GLboolean scissorTest = glIsEnabled(GL_SCISSOR_TEST);
+    
+    GLboolean depthTest = glIsEnabled(GL_DEPTH_TEST);
+    GLint depthFunc;
+    glGetIntegerv(GL_DEPTH_FUNC, &depthFunc);
+    GLboolean depthMask;
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &depthMask);
+    
+    GLboolean blend = glIsEnabled(GL_BLEND);
+    GLint blendSrcRGB, blendDstRGB, blendSrcAlpha, blendDstAlpha;
+    glGetIntegerv(GL_BLEND_SRC_RGB, &blendSrcRGB);
+    glGetIntegerv(GL_BLEND_DST_RGB, &blendDstRGB);
+    glGetIntegerv(GL_BLEND_SRC_ALPHA, &blendSrcAlpha);
+    glGetIntegerv(GL_BLEND_DST_ALPHA, &blendDstAlpha);
+    
+    GLboolean cullFace = glIsEnabled(GL_CULL_FACE);
+    GLint cullMode;
+    glGetIntegerv(GL_CULL_FACE_MODE, &cullMode);
+    
+    GLboolean colorMask[4];
+    glGetBooleanv(GL_COLOR_WRITEMASK, colorMask);
+    
+    GLboolean stencilTest = glIsEnabled(GL_STENCIL_TEST);
+    
+    GLboolean polygonOffsetFill = glIsEnabled(GL_POLYGON_OFFSET_FILL);
+    float polyOffsetFactor, polyOffsetUnits;
+    glGetFloatv(GL_POLYGON_OFFSET_FACTOR, &polyOffsetFactor);
+    glGetFloatv(GL_POLYGON_OFFSET_UNITS, &polyOffsetUnits);
+    
+    GLint currentProgram;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &currentProgram);
+    
+    GLint boundVAO;
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &boundVAO);
+    
+    GLint activeTexture;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &activeTexture);
+    
+    GLint boundTex2D[4];
+    for (int i = 0; i < 4; ++i) {
+        glActiveTexture(GL_TEXTURE0 + i);
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &boundTex2D[i]);
+    }
+    glActiveTexture(GL_TEXTURE0);
+    
+    GLint boundFBO;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &boundFBO);
+    
+    float clearDepth;
+    glGetFloatv(GL_DEPTH_CLEAR_VALUE, &clearDepth);
+    
+    const char* depthFuncStr = "UNKNOWN";
+    switch (depthFunc) {
+        case GL_NEVER: depthFuncStr = "NEVER"; break;
+        case GL_LESS: depthFuncStr = "LESS"; break;
+        case GL_EQUAL: depthFuncStr = "EQUAL"; break;
+        case GL_LEQUAL: depthFuncStr = "LEQUAL"; break;
+        case GL_GREATER: depthFuncStr = "GREATER"; break;
+        case GL_NOTEQUAL: depthFuncStr = "NOTEQUAL"; break;
+        case GL_GEQUAL: depthFuncStr = "GEQUAL"; break;
+        case GL_ALWAYS: depthFuncStr = "ALWAYS"; break;
+    }
+    
+    const char* cullModeStr = "UNKNOWN";
+    switch (cullMode) {
+        case GL_FRONT: cullModeStr = "FRONT"; break;
+        case GL_BACK: cullModeStr = "BACK"; break;
+        case GL_FRONT_AND_BACK: cullModeStr = "FRONT_AND_BACK"; break;
+    }
+    
+    const char* blendSrcStr = "UNKNOWN";
+    switch (blendSrcRGB) {
+        case GL_ZERO: blendSrcStr = "ZERO"; break;
+        case GL_ONE: blendSrcStr = "ONE"; break;
+        case GL_SRC_COLOR: blendSrcStr = "SRC_COLOR"; break;
+        case GL_ONE_MINUS_SRC_COLOR: blendSrcStr = "ONE_MINUS_SRC_COLOR"; break;
+        case GL_DST_COLOR: blendSrcStr = "DST_COLOR"; break;
+        case GL_ONE_MINUS_DST_COLOR: blendSrcStr = "ONE_MINUS_DST_COLOR"; break;
+        case GL_SRC_ALPHA: blendSrcStr = "SRC_ALPHA"; break;
+        case GL_ONE_MINUS_SRC_ALPHA: blendSrcStr = "ONE_MINUS_SRC_ALPHA"; break;
+        case GL_DST_ALPHA: blendSrcStr = "DST_ALPHA"; break;
+        case GL_ONE_MINUS_DST_ALPHA: blendSrcStr = "ONE_MINUS_DST_ALPHA"; break;
+        case GL_CONSTANT_COLOR: blendSrcStr = "CONSTANT_COLOR"; break;
+        case GL_ONE_MINUS_CONSTANT_COLOR: blendSrcStr = "ONE_MINUS_CONSTANT_COLOR"; break;
+        case GL_CONSTANT_ALPHA: blendSrcStr = "CONSTANT_ALPHA"; break;
+        case GL_ONE_MINUS_CONSTANT_ALPHA: blendSrcStr = "ONE_MINUS_CONSTANT_ALPHA"; break;
+        case GL_SRC_ALPHA_SATURATE: blendSrcStr = "SRC_ALPHA_SATURATE"; break;
+    }
+    
+    const char* blendDstStr = "UNKNOWN";
+    switch (blendDstRGB) {
+        case GL_ZERO: blendDstStr = "ZERO"; break;
+        case GL_ONE: blendDstStr = "ONE"; break;
+        case GL_SRC_COLOR: blendDstStr = "SRC_COLOR"; break;
+        case GL_ONE_MINUS_SRC_COLOR: blendDstStr = "ONE_MINUS_SRC_COLOR"; break;
+        case GL_DST_COLOR: blendDstStr = "DST_COLOR"; break;
+        case GL_ONE_MINUS_DST_COLOR: blendDstStr = "ONE_MINUS_DST_COLOR"; break;
+        case GL_SRC_ALPHA: blendDstStr = "SRC_ALPHA"; break;
+        case GL_ONE_MINUS_SRC_ALPHA: blendDstStr = "ONE_MINUS_SRC_ALPHA"; break;
+        case GL_DST_ALPHA: blendDstStr = "DST_ALPHA"; break;
+        case GL_ONE_MINUS_DST_ALPHA: blendDstStr = "ONE_MINUS_DST_ALPHA"; break;
+    }
+    
+    std::printf("\n=== GL STATE DUMP: %s ===\n", label);
+    std::printf("  Viewport: %d %d %d %d\n", viewport[0], viewport[1], viewport[2], viewport[3]);
+    std::printf("  Scissor: %d %d %d %d  Enabled: %s\n", scissor[0], scissor[1], scissor[2], scissor[3], scissorTest ? "YES" : "NO");
+    std::printf("  DepthTest: %s  Func: %s  Mask: %s\n", depthTest ? "ON" : "OFF", depthFuncStr, depthMask ? "TRUE" : "FALSE");
+    std::printf("  Blend: %s  Src: %s  Dst: %s\n", blend ? "ON" : "OFF", blendSrcStr, blendDstStr);
+    std::printf("  CullFace: %s  Mode: %s\n", cullFace ? "ON" : "OFF", cullModeStr);
+    std::printf("  ColorMask: R=%s G=%s B=%s A=%s\n", 
+                colorMask[0] ? "T" : "F", colorMask[1] ? "T" : "F", colorMask[2] ? "T" : "F", colorMask[3] ? "T" : "F");
+    std::printf("  StencilTest: %s\n", stencilTest ? "ON" : "OFF");
+    std::printf("  PolygonOffset: %s  Factor: %.3f  Units: %.3f\n", polygonOffsetFill ? "ON" : "OFF", polyOffsetFactor, polyOffsetUnits);
+    std::printf("  CurrentProgram: %u\n", (unsigned)currentProgram);
+    std::printf("  BoundVAO: %u\n", (unsigned)boundVAO);
+    std::printf("  ActiveTexture: GL_TEXTURE%d\n", activeTexture - GL_TEXTURE0);
+    std::printf("  BoundTex2D[0-3]: %u %u %u %u\n", (unsigned)boundTex2D[0], (unsigned)boundTex2D[1], (unsigned)boundTex2D[2], (unsigned)boundTex2D[3]);
+    std::printf("  BoundFBO: %u\n", (unsigned)boundFBO);
+    std::printf("  ClearDepth: %.6f\n", clearDepth);
+    std::printf("=== END GL STATE DUMP ===\n\n");
+}
+
 // ============================================================ matrices (column-major)
 static void mat4mul(const float* a, const float* b, float* o) {
     for (int c = 0; c < 4; ++c)
@@ -824,6 +1118,32 @@ static void pushQuad(std::vector<float>& v, V3 a, V3 b, V3 c, V3 d, V3 n, V3 col
     vert(a); vert(c); vert(d);
 }
 
+static void pushTri(std::vector<float>& v, V3 a, V3 b, V3 c, V3 n, V3 col, float mat) {
+    auto vert = [&](V3 p) {
+        float f[10] = {p.x, p.y, p.z, n.x, n.y, n.z, col.x, col.y, col.z, mat};
+        v.insert(v.end(), f, f + 10);
+    };
+    vert(a); vert(b); vert(c);
+}
+
+// 11-float versions for propeller overlay (with propIdx attribute)
+static void pushQuad11(std::vector<float>& v, V3 a, V3 b, V3 c, V3 d, V3 n, V3 col, float mat, float propIdx) {
+    auto vert = [&](V3 p) {
+        float f[11] = {p.x, p.y, p.z, n.x, n.y, n.z, col.x, col.y, col.z, mat, propIdx};
+        v.insert(v.end(), f, f + 11);
+    };
+    vert(a); vert(b); vert(c);
+    vert(a); vert(c); vert(d);
+}
+
+static void pushTri11(std::vector<float>& v, V3 a, V3 b, V3 c, V3 n, V3 col, float mat, float propIdx) {
+    auto vert = [&](V3 p) {
+        float f[11] = {p.x, p.y, p.z, n.x, n.y, n.z, col.x, col.y, col.z, mat, propIdx};
+        v.insert(v.end(), f, f + 11);
+    };
+    vert(a); vert(b); vert(c);
+}
+
 static std::vector<float> buildMesh(const std::vector<Box>& boxes) {
     std::vector<float> v;
     v.reserve(boxes.size() * 36 * 10);
@@ -841,6 +1161,465 @@ static std::vector<float> buildMesh(const std::vector<Box>& boxes) {
         pushQuad(v, {hi.x, lo.y, lo.z}, {lo.x, lo.y, lo.z}, {lo.x, hi.y, lo.z}, {hi.x, hi.y, lo.z}, {0, 0, -1}, b.color, m);
     }
     return v;
+}
+
+// Build drone mesh from primitives (boxes/cylinders)
+// Returns vertex data: pos(3), normal(3), color(3), material(1) = 10 floats per vertex
+static std::vector<float> buildDroneMesh(const DroneParams& P) {
+    std::vector<float> v;
+    v.reserve(500 * 3 * 10); // target under 500 triangles
+    
+    // Helper lambda to add a box
+    auto addBox = [&](const V3& lo, const V3& hi, const V3& color, float mat) {
+        pushQuad(v, {hi.x, lo.y, lo.z}, {hi.x, hi.y, lo.z}, {hi.x, hi.y, hi.z}, {hi.x, lo.y, hi.z}, {1, 0, 0}, color, mat);
+        pushQuad(v, {lo.x, lo.y, hi.z}, {lo.x, hi.y, hi.z}, {lo.x, hi.y, lo.z}, {lo.x, lo.y, lo.z}, {-1, 0, 0}, color, mat);
+        pushQuad(v, {lo.x, hi.y, lo.z}, {lo.x, hi.y, hi.z}, {hi.x, hi.y, hi.z}, {hi.x, hi.y, lo.z}, {0, 1, 0}, color, mat);
+        pushQuad(v, {lo.x, lo.y, hi.z}, {lo.x, lo.y, lo.z}, {hi.x, lo.y, lo.z}, {hi.x, lo.y, hi.z}, {0, -1, 0}, color, mat);
+        pushQuad(v, {lo.x, lo.y, hi.z}, {hi.x, lo.y, hi.z}, {hi.x, hi.y, hi.z}, {lo.x, hi.y, hi.z}, {0, 0, 1}, color, mat);
+        pushQuad(v, {hi.x, lo.y, lo.z}, {lo.x, lo.y, lo.z}, {lo.x, hi.y, lo.z}, {hi.x, hi.y, lo.z}, {0, 0, -1}, color, mat);
+    };
+    
+    // Helper lambda to add a cylinder (approximated as 8-sided prism)
+    auto addCylinder = [&](const V3& base, float radius, float height, const V3& color, float mat, const V3& axis) {
+        const int sides = 8;
+        V3 up = axis;
+        V3 right, forward;
+        if (std::fabs(up.y) > 0.9f) {
+            right = {1, 0, 0};
+            forward = {0, 0, 1};
+        } else {
+            right = normalize3(cross({0, 1, 0}, up));
+            forward = cross(up, right);
+        }
+        
+        std::vector<V3> bottomVerts, topVerts;
+        for (int i = 0; i < sides; ++i) {
+            float a = 2.f * PI * i / sides;
+            V3 offset = right * (radius * std::cos(a)) + forward * (radius * std::sin(a));
+            bottomVerts.push_back(base + offset);
+            topVerts.push_back(base + up * height + offset);
+        }
+        
+        // Side quads
+        for (int i = 0; i < sides; ++i) {
+            int ni = (i + 1) % sides;
+            V3 b0 = bottomVerts[i], b1 = bottomVerts[ni];
+            V3 t0 = topVerts[i], t1 = topVerts[ni];
+            V3 normal = normalize3(cross(t1 - b1, b0 - b1));
+            pushQuad(v, b0, b1, t1, t0, normal, color, mat);
+        }
+        
+        // Bottom cap
+        for (int i = 1; i < sides - 1; ++i) {
+            V3 normal = {-up.x, -up.y, -up.z};
+            pushTri(v, bottomVerts[0], bottomVerts[i+1], bottomVerts[i], normal, color, mat);
+        }
+        
+        // Top cap
+        for (int i = 1; i < sides - 1; ++i) {
+            pushTri(v, topVerts[0], topVerts[i], topVerts[i+1], up, color, mat);
+        }
+    };
+    
+    // Helper to add a thin disc (for propellers)
+    auto addDisc = [&](const V3& center, float radius, const V3& normal, const V3& color, float mat) {
+        const int sides = 6;
+        V3 up = normal;
+        V3 right, forward;
+        if (std::fabs(up.y) > 0.9f) {
+            right = {1, 0, 0};
+            forward = {0, 0, 1};
+        } else {
+            right = normalize3(cross({0, 1, 0}, up));
+            forward = cross(up, right);
+        }
+        
+        // Two triangles for a thin disc (top and bottom)
+        for (int pass = 0; pass < 2; ++pass) {
+            V3 n = pass == 0 ? up : V3{-up.x, -up.y, -up.z};
+            for (int i = 1; i < sides - 1; ++i) {
+                float a0 = 2.f * PI * i / sides;
+                float a1 = 2.f * PI * (i + 1) / sides;
+                V3 v0 = center + right * (radius * std::cos(2.f * PI * 0 / sides)) + forward * (radius * std::sin(2.f * PI * 0 / sides));
+                V3 v1 = center + right * (radius * std::cos(a0)) + forward * (radius * std::sin(a0));
+                V3 v2 = center + right * (radius * std::cos(a1)) + forward * (radius * std::sin(a1));
+                pushTri(v, v0, v1, v2, n, color, mat);
+            }
+        }
+    };
+    
+    // Helper to add an oriented box (for arms at 45 degrees)
+    auto addOrientedBox = [&](const V3& center, const V3& halfExtents, const V3& xAxis, const V3& yAxis, const V3& zAxis, const V3& color, float mat) {
+        // 8 corners of the box
+        V3 corners[8];
+        for (int i = 0; i < 8; ++i) {
+            float sx = (i & 1) ? halfExtents.x : -halfExtents.x;
+            float sy = (i & 2) ? halfExtents.y : -halfExtents.y;
+            float sz = (i & 4) ? halfExtents.z : -halfExtents.z;
+            corners[i] = center + xAxis * sx + yAxis * sy + zAxis * sz;
+        }
+        // 6 faces, each as 2 triangles
+        // +X face: corners 1,3,7,5
+        pushQuad(v, corners[1], corners[3], corners[7], corners[5], xAxis, color, mat);
+        // -X face: corners 0,2,6,4
+        pushQuad(v, corners[0], corners[4], corners[6], corners[2], V3{-xAxis.x, -xAxis.y, -xAxis.z}, color, mat);
+        // +Y face: corners 2,3,7,6
+        pushQuad(v, corners[2], corners[3], corners[7], corners[6], yAxis, color, mat);
+        // -Y face: corners 0,1,5,4
+        pushQuad(v, corners[0], corners[4], corners[5], corners[1], V3{-yAxis.x, -yAxis.y, -yAxis.z}, color, mat);
+        // +Z face: corners 4,5,7,6
+        pushQuad(v, corners[4], corners[5], corners[7], corners[6], zAxis, color, mat);
+        // -Z face: corners 0,1,3,2
+        pushQuad(v, corners[0], corners[2], corners[3], corners[1], V3{-zAxis.x, -zAxis.y, -zAxis.z}, color, mat);
+    };
+    
+    // Colors
+    V3 bodyColor = {0.15f, 0.15f, 0.18f};
+    V3 armColor = {0.20f, 0.20f, 0.22f};
+    V3 motorColor = {0.10f, 0.10f, 0.12f};
+    V3 propColor = {0.05f, 0.05f, 0.07f};
+    V3 cameraColor = {0.08f, 0.08f, 0.10f};
+    V3 batteryColor = {0.12f, 0.12f, 0.14f};
+    float mat = 1.0f; // standard material
+    
+    // Sizes based on drone preset (5" or 3.5")
+    float armLen = P.armLength; // distance from center to motor
+    float armCoord = armLen * 0.70710678f; // X/Z coordinate of motors
+    float bodyWidth = armLen * 0.35f;
+    float bodyDepth = armLen * 0.25f;
+    float bodyHeight = 0.025f;
+    float armWidth = armLen * 0.10f;
+    float armHeight = 0.010f;
+    float armLength3D = armLen * 0.95f; // arm length from center to near motor
+    float motorRadius = armLen * 0.06f;
+    float motorHeight = 0.02f;
+    float propRadius = armLen * 0.45f;
+    float cameraSize = armLen * 0.15f;
+    float batteryWidth = bodyWidth * 0.7f;
+    float batteryDepth = bodyDepth * 0.5f;
+    float batteryHeight = 0.03f;
+    
+    // Central body (flat box)
+    addBox({-bodyWidth, -bodyHeight * 0.5f, -bodyDepth},
+           {bodyWidth, bodyHeight * 0.5f, bodyDepth}, bodyColor, mat);
+    
+    // Battery on top
+    addBox({-batteryWidth, bodyHeight * 0.5f, -batteryDepth},
+           {batteryWidth, bodyHeight * 0.5f + batteryHeight, batteryDepth}, batteryColor, mat);
+    
+    // 4 arms in X layout - oriented along diagonals
+    // Arm direction vectors (from center to motor)
+    V3 armDirs[4] = {
+        { armCoord, 0, -armCoord }, // front-right
+        {-armCoord, 0, -armCoord }, // front-left
+        {-armCoord, 0,  armCoord }, // back-left
+        { armCoord, 0,  armCoord }, // back-right
+    };
+    
+    for (int i = 0; i < 4; ++i) {
+        V3 dir = normalize3(armDirs[i]);
+        V3 up = {0, 1, 0};
+        V3 right = normalize3(cross(up, dir));
+        V3 center = dir * (armLength3D * 0.5f);
+        V3 halfExtents = {armLength3D * 0.5f, armHeight * 0.5f, armWidth * 0.5f};
+        addOrientedBox(center, halfExtents, dir, up, right, armColor, mat);
+    }
+    
+    // 4 motors at arm ends (cylinders pointing up)
+    for (int i = 0; i < 4; ++i) {
+        V3 motorPos = armDirs[i];
+        motorPos.y = motorHeight * 0.5f;
+        addCylinder(motorPos - V3{0, motorHeight * 0.5f, 0}, motorRadius, motorHeight, motorColor, mat, {0, 1, 0});
+    }
+    
+    // 4 propellers at motor positions (thin discs, horizontal)
+    for (int i = 0; i < 4; ++i) {
+        V3 propPos = armDirs[i];
+        propPos.y = motorHeight + 0.002f; // just above motor
+        addDisc(propPos, propRadius, {0, 1, 0}, propColor, mat);
+    }
+    
+    // Camera at front (small box tilted with camera)
+    // Front is -Z direction
+    V3 camPos = {0, bodyHeight * 0.5f + cameraSize * 0.5f, -bodyDepth - cameraSize * 0.5f};
+    addBox({-cameraSize * 0.5f, camPos.y - cameraSize * 0.5f, camPos.z - cameraSize * 0.5f},
+           {cameraSize * 0.5f, camPos.y + cameraSize * 0.5f, camPos.z + cameraSize * 0.5f}, cameraColor, mat);
+    
+    return v;
+}
+
+// Build propeller overlay mesh (only parts in front of camera: props, motors, front arms)
+// Returns vertex data: pos(3), normal(3), color(3), material(1), propIndex(1) = 11 floats per vertex
+// propIndex: 0-3 for each prop, 4 for motors, 5 for front arms, -1 for other
+static std::vector<float> buildPropOverlayMesh(const DroneParams& P) {
+    std::vector<float> v;
+    v.reserve(300 * 3 * 11); // target under 300 triangles
+    
+    // Helper lambda to add a cylinder (approximated as 8-sided prism)
+    auto addCylinder = [&](const V3& base, float radius, float height, const V3& color, float mat, const V3& axis, float propIdx) {
+        const int sides = 8;
+        V3 up = axis;
+        V3 right, forward;
+        if (std::fabs(up.y) > 0.9f) {
+            right = {1, 0, 0};
+            forward = {0, 0, 1};
+        } else {
+            right = normalize3(cross({0, 1, 0}, up));
+            forward = cross(up, right);
+        }
+        
+        std::vector<V3> bottomVerts, topVerts;
+        for (int i = 0; i < sides; ++i) {
+            float a = 2.f * PI * i / sides;
+            V3 offset = right * (radius * std::cos(a)) + forward * (radius * std::sin(a));
+            bottomVerts.push_back(base + offset);
+            topVerts.push_back(base + up * height + offset);
+        }
+        
+        // Side quads
+        for (int i = 0; i < sides; ++i) {
+            int ni = (i + 1) % sides;
+            V3 b0 = bottomVerts[i], b1 = bottomVerts[ni];
+            V3 t0 = topVerts[i], t1 = topVerts[ni];
+            V3 normal = normalize3(cross(t1 - b1, b0 - b1));
+            pushQuad11(v, b0, b1, t1, t0, normal, color, mat, propIdx);
+        }
+        
+        // Bottom cap
+        for (int i = 1; i < sides - 1; ++i) {
+            V3 normal = {-up.x, -up.y, -up.z};
+            pushTri11(v, bottomVerts[0], bottomVerts[i+1], bottomVerts[i], normal, color, mat, propIdx);
+        }
+        
+        // Top cap
+        for (int i = 1; i < sides - 1; ++i) {
+            pushTri11(v, topVerts[0], topVerts[i], topVerts[i+1], up, color, mat, propIdx);
+        }
+    };
+    
+    // Helper to add a thin disc (for propellers) with 2 or 3 blades
+    auto addPropDisc = [&](const V3& center, float radius, const V3& normal, const V3& color, float mat, float propIdx, int blades = 3) {
+        V3 up = normal;
+        V3 right, forward;
+        if (std::fabs(up.y) > 0.9f) {
+            right = {1, 0, 0};
+            forward = {0, 0, 1};
+        } else {
+            right = normalize3(cross({0, 1, 0}, up));
+            forward = cross(up, right);
+        }
+        
+        // Create individual blades as thin triangles
+        for (int b = 0; b < blades; ++b) {
+            float bladeAngle = 2.f * PI * b / blades;
+            V3 bladeDir = right * std::cos(bladeAngle) + forward * std::sin(bladeAngle);
+            V3 bladePerp = right * (-std::sin(bladeAngle)) + forward * std::cos(bladeAngle);
+            
+            // Blade dimensions: length = radius, width at root = radius * 0.25, width at tip = radius * 0.1
+            float bladeLen = radius;
+            float rootWidth = radius * 0.25f;
+            float tipWidth = radius * 0.1f;
+            
+            V3 rootL = center - bladePerp * rootWidth;
+            V3 rootR = center + bladePerp * rootWidth;
+            V3 tipL = center + bladeDir * bladeLen - bladePerp * tipWidth;
+            V3 tipR = center + bladeDir * bladeLen + bladePerp * tipWidth;
+            
+            // Two triangles per blade (top and bottom)
+            pushQuad11(v, rootL, rootR, tipR, tipL, up, color, mat, propIdx);
+            pushQuad11(v, rootL, rootR, tipR, tipL, V3{-up.x, -up.y, -up.z}, color, mat, propIdx);
+        }
+        
+        // Hub (small disc at center)
+        float hubRadius = radius * 0.2f;
+        const int hubSides = 6;
+        for (int pass = 0; pass < 2; ++pass) {
+            V3 n = pass == 0 ? up : V3{-up.x, -up.y, -up.z};
+            for (int i = 1; i < hubSides - 1; ++i) {
+                float a0 = 2.f * PI * i / hubSides;
+                float a1 = 2.f * PI * (i + 1) / hubSides;
+                V3 v0 = center + right * (hubRadius * std::cos(0)) + forward * (hubRadius * std::sin(0));
+                V3 v1 = center + right * (hubRadius * std::cos(a0)) + forward * (hubRadius * std::sin(a0));
+                V3 v2 = center + right * (hubRadius * std::cos(a1)) + forward * (hubRadius * std::sin(a1));
+                pushTri11(v, v0, v1, v2, n, color, mat, propIdx);
+            }
+        }
+    };
+    
+    // Helper to add an oriented box (for arms at 45 degrees)
+    auto addOrientedBox = [&](const V3& center, const V3& halfExtents, const V3& xAxis, const V3& yAxis, const V3& zAxis, const V3& color, float mat, float propIdx) {
+        V3 corners[8];
+        for (int i = 0; i < 8; ++i) {
+            float sx = (i & 1) ? halfExtents.x : -halfExtents.x;
+            float sy = (i & 2) ? halfExtents.y : -halfExtents.y;
+            float sz = (i & 4) ? halfExtents.z : -halfExtents.z;
+            corners[i] = center + xAxis * sx + yAxis * sy + zAxis * sz;
+        }
+        pushQuad11(v, corners[1], corners[3], corners[7], corners[5], xAxis, color, mat, propIdx);
+        pushQuad11(v, corners[0], corners[4], corners[6], corners[2], V3{-xAxis.x, -xAxis.y, -xAxis.z}, color, mat, propIdx);
+        pushQuad11(v, corners[2], corners[3], corners[7], corners[6], yAxis, color, mat, propIdx);
+        pushQuad11(v, corners[0], corners[4], corners[5], corners[1], V3{-yAxis.x, -yAxis.y, -yAxis.z}, color, mat, propIdx);
+        pushQuad11(v, corners[4], corners[5], corners[7], corners[6], zAxis, color, mat, propIdx);
+        pushQuad11(v, corners[0], corners[2], corners[3], corners[1], V3{-zAxis.x, -zAxis.y, -zAxis.z}, color, mat, propIdx);
+    };
+    
+    // Colors
+    V3 armColor = {0.20f, 0.20f, 0.22f};
+    V3 motorColor = {0.10f, 0.10f, 0.12f};
+    V3 propColor = {0.05f, 0.05f, 0.07f};
+    float mat = 1.0f;
+    
+    // Sizes based on drone preset (5" or 3.5")
+    float armLen = P.armLength;
+    float armCoord = armLen * 0.70710678f;
+    float bodyDepth = armLen * 0.25f;
+    float bodyHeight = 0.025f;
+    float armWidth = armLen * 0.10f;
+    float armHeight = 0.010f;
+    float armLength3D = armLen * 0.95f;
+    float motorRadius = armLen * 0.06f;
+    float motorHeight = 0.02f;
+    float propRadius = armLen * 0.45f;
+    float cameraSize = armLen * 0.15f;
+    
+    // Camera position in drone-local frame - MATCH MAIN CAMERA: {0, 0.03f, -0.07f}
+    V3 camLocalPos = {0, 0.03f, -0.07f};
+    
+    // 4 arms in X layout - front two arms are indices 0, 1 (front-right, front-left)
+    V3 armDirs[4] = {
+        { armCoord, 0, -armCoord }, // front-right (index 0)
+        {-armCoord, 0, -armCoord }, // front-left (index 1)
+        {-armCoord, 0,  armCoord }, // back-left (index 2)
+        { armCoord, 0,  armCoord }, // back-right (index 3)
+    };
+    
+    // Ensure front props are IN FRONT of camera (more negative Z) for visibility
+    // Camera is at camLocalPos.z = -0.07. Front props should be at z < -0.07.
+    // Use actual arm Z or 3cm in front of camera, whichever is more forward.
+    float propZ = std::min(-armCoord, camLocalPos.z - 0.03f); // 3cm in front of camera
+    
+    // Add front arm portions (only front two arms: indices 0, 1)
+    // Extend arms to propZ position
+    for (int i = 0; i < 2; ++i) {
+        V3 dir = normalize3({armDirs[i].x, 0, propZ}); // direction to prop position
+        V3 up = {0, 1, 0};
+        V3 right = normalize3(cross(up, dir));
+        float armLenToProp = std::sqrt(armDirs[i].x * armDirs[i].x + propZ * propZ);
+        V3 center = {armDirs[i].x * 0.5f, 0, propZ * 0.5f};
+        V3 halfExtents = {armLenToProp * 0.5f, armHeight * 0.5f, armWidth * 0.5f};
+        addOrientedBox(center, halfExtents, dir, up, right, armColor, mat, 5.f); // propIdx = 5 for front arms
+    }
+    
+    // 4 motors at arm ends - only front two (indices 0, 1)
+    for (int i = 0; i < 2; ++i) {
+        V3 motorPos = {armDirs[i].x, motorHeight * 0.5f, propZ};
+        addCylinder(motorPos - V3{0, motorHeight * 0.5f, 0}, motorRadius, motorHeight, motorColor, mat, {0, 1, 0}, 4.f); // propIdx = 4 for motors
+    }
+    
+    // 4 propellers at motor positions - only front two (indices 0, 1)
+    for (int i = 0; i < 2; ++i) {
+        V3 propPos = {armDirs[i].x, motorHeight + 0.002f, propZ};
+        addPropDisc(propPos, propRadius, {0, 1, 0}, propColor, mat, (float)i, 3); // 3 blades per prop
+    }
+    
+    return v;
+}
+
+// Raycast downward from a point to find the nearest surface in the world
+// Returns true if hit, sets outHitY to the Y coordinate of the hit surface,
+// and outNormal to the surface normal
+static bool raycastDown(const V3& origin, const std::vector<Box>& world, const std::vector<ThinCylinder>& thinCylinders, float maxDist, float& outHitY, V3& outNormal) {
+    float bestT = maxDist;
+    bool hit = false;
+    V3 rayDir = {0, -1, 0}; // straight down
+    
+    // Check boxes
+    for (const Box& b : world) {
+        // Ray-box intersection (slab method)
+        // Ray: origin + t * rayDir, t >= 0
+        float tmin = -1e30f, tmax = 1e30f;
+        
+        // X slab
+        if (rayDir.x != 0) {
+            float tx1 = (b.mn.x - origin.x) / rayDir.x;
+            float tx2 = (b.mx.x - origin.x) / rayDir.x;
+            if (tx1 > tx2) std::swap(tx1, tx2);
+            tmin = std::max(tmin, tx1);
+            tmax = std::min(tmax, tx2);
+        } else if (origin.x < b.mn.x || origin.x > b.mx.x) {
+            continue; // ray parallel to slab and outside
+        }
+        
+        // Y slab
+        if (rayDir.y != 0) {
+            float ty1 = (b.mn.y - origin.y) / rayDir.y;
+            float ty2 = (b.mx.y - origin.y) / rayDir.y;
+            if (ty1 > ty2) std::swap(ty1, ty2);
+            tmin = std::max(tmin, ty1);
+            tmax = std::min(tmax, ty2);
+        } else if (origin.y < b.mn.y || origin.y > b.mx.y) {
+            continue;
+        }
+        
+        // Z slab
+        if (rayDir.z != 0) {
+            float tz1 = (b.mn.z - origin.z) / rayDir.z;
+            float tz2 = (b.mx.z - origin.z) / rayDir.z;
+            if (tz1 > tz2) std::swap(tz1, tz2);
+            tmin = std::max(tmin, tz1);
+            tmax = std::min(tmax, tz2);
+        } else if (origin.z < b.mn.z || origin.z > b.mx.z) {
+            continue;
+        }
+        
+        if (tmin <= tmax && tmax >= 0 && tmin < bestT) {
+            // Hit! The entry point is at tmin (or tmax if origin inside)
+            float t = tmin >= 0 ? tmin : tmax;
+            if (t >= 0 && t < bestT) {
+                bestT = t;
+                hit = true;
+                // For downward ray, we hit the top face (y = b.mx.y)
+                outHitY = b.mx.y;
+                outNormal = {0, 1, 0}; // top face normal
+            }
+        }
+    }
+    
+    // Check thin cylinders (wires, rebar, pipes)
+    for (const ThinCylinder& tc : thinCylinders) {
+        // For vertical downward ray, check if ray passes through cylinder horizontally
+        // Cylinder axis is line segment from tc.p1 to tc.p2
+        // Ray is at (origin.x, origin.z) going down
+        
+        // Find the point on cylinder axis closest to ray's x-z position
+        V3 a = tc.p1;
+        V3 b = tc.p2;
+        V3 ab = {b.x - a.x, b.y - a.y, b.z - a.z};
+        float len2 = ab.x*ab.x + ab.y*ab.y + ab.z*ab.z;
+        
+        if (len2 > 1e-8f) {
+            // Project ray's x-z onto cylinder axis in x-z plane
+            float t = clampf(((origin.x - a.x)*ab.x + (origin.z - a.z)*ab.z) / len2, 0.f, 1.f);
+            // The y coordinate at this point on the axis
+            float axisY = a.y + ab.y * t;
+            // Horizontal distance from ray to axis at this point
+            float dx = origin.x - (a.x + ab.x * t);
+            float dz = origin.z - (a.z + ab.z * t);
+            float horizDist = std::sqrt(dx*dx + dz*dz);
+            
+            if (horizDist <= tc.radius && axisY < origin.y && (origin.y - axisY) < bestT) {
+                // Ray hits the cylinder
+                bestT = origin.y - axisY;
+                hit = true;
+                outHitY = axisY;
+                // Normal points horizontally away from cylinder axis
+                float invDist = horizDist > 1e-6f ? 1.f / horizDist : 0.f;
+                outNormal = {dx * invDist, 0, dz * invDist};
+            }
+        }
+    }
+    
+    return hit;
 }
 
 // VideoSignalState is updated every frame; kept as a persistent variable in main().
@@ -990,7 +1769,7 @@ static int settingTab(const Entry& e) {
         k == "contact_skin_m" || k == "show_hitbox" || k == "straighten_yaw_on_landing" ||
         k == "landing_snap") return 9;
     if (k.find("window_") == 0 || k == "fullscreen" || k == "vsync" || k == "msaa" || k == "fog_density") return 1;
-    if (k.find("cam_") == 0 || k.find("fov_") == 0) return 2;
+    if (k.find("cam_") == 0 || k.find("fov_") == 0 || k == "props_in_view" || k == "props_opacity" || k == "props_lowering") return 2;
     if (k.find("axis_") == 0 || k.find("invert_") == 0 || k == "joystick_name_contains" ||
         k == "deadband" || k == "arm_threshold") return 3;
     if (k.find("_rate") != std::string::npos || k.find("_expo") != std::string::npos) return 4;
@@ -1012,6 +1791,9 @@ static std::string settingLabel(const char* key) {
     if (s == "abandoned_base_seed") return "ABANDONED BASE SEED";
     if (s == "cam_tilt_deg") return "CAMERA TILT DEG";
     if (s == "fov_horizontal_deg") return "HORIZONTAL FOV";
+    if (s == "props_in_view") return "PROPS IN VIEW";
+    if (s == "props_opacity") return "PROPS OPACITY";
+    if (s == "props_lowering") return "PROPS LOWERING";
     if (s == "video_enabled")              return "ANALOG VIDEO EFFECTS";
     if (s == "video_noise")                return "GRAIN / SNOW";
     if (s == "video_snow_strength")        return "SNOW STRENGTH";
@@ -1062,6 +1844,7 @@ static std::string settingLabel(const char* key) {
     if (s == "shadow_filter") return "SHADOW FILTERING";
     if (s == "shadow_stable_snapping") return "STABLE SHADOW SNAPPING";
     if (s == "shadow_debug") return "SHADOW DEBUG HUD";
+    if (s == "drone_shadow") return "DRONE SHADOW";
     if (s == "joystick_name_contains") return "JOYSTICK NAME FILTER";
     if (s == "battery_cells") return "BATTERY CELLS";
     if (s == "battery_mah") return "BATTERY CAPACITY MAH";
@@ -1143,31 +1926,41 @@ static void applyWindConfig(Sim& sim, const Config& c) {
 static void applyDroneProfile(Config& c) {
     DroneParams p = c.drone;
     switch (c.droneSize) {
-        case 0:  // 75 mm 1S micro/whoop
+        case 0:  // 75 mm 1S micro/whoop - ducted props, compact frame
             p.mass = 0.035f; p.thrustRatio = 3.5f; p.cells = 1; p.capacityMah = 450.f;
             p.packResistance = 0.030f; p.radius = 0.055f; p.armLength = 0.045f; p.motorTau = 0.008f; p.maxMotorRPM = 50000.f; p.rateTau = 0.018f;
             p.yawTau = 0.040f; p.propPitchSpeed = 35.f; p.dragK = {0.075f, 0.006f, 0.030f};
-            p.dragLin = {0.025f, 0.008f, 0.030f}; break;
-        case 1:  // 85 mm 2S micro
+            p.dragLin = {0.025f, 0.008f, 0.030f};
+            p.colliderScale = 0.90f;  // Ducts make effective collision radius smaller
+            break;
+        case 1:  // 85 mm 2S micro - open props, slightly larger
             p.mass = 0.065f; p.thrustRatio = 4.5f; p.cells = 2; p.capacityMah = 450.f;
             p.packResistance = 0.035f; p.radius = 0.065f; p.armLength = 0.050f; p.motorTau = 0.010f; p.maxMotorRPM = 45000.f; p.rateTau = 0.020f;
             p.yawTau = 0.045f; p.propPitchSpeed = 45.f; p.dragK = {0.050f, 0.009f, 0.022f};
-            p.dragLin = {0.035f, 0.010f, 0.035f}; break;
-        case 2:  // 3 inch freestyle
+            p.dragLin = {0.035f, 0.010f, 0.035f};
+            p.colliderScale = 0.95f;
+            break;
+        case 2:  // 3 inch freestyle - standard open frame
             p.mass = 0.180f; p.thrustRatio = 5.5f; p.cells = 4; p.capacityMah = 850.f;
             p.packResistance = 0.040f; p.radius = 0.090f; p.armLength = 0.065f; p.motorTau = 0.014f; p.maxMotorRPM = 38000.f; p.rateTau = 0.021f;
             p.yawTau = 0.048f; p.propPitchSpeed = 58.f; p.dragK = {0.030f, 0.020f, 0.012f};
-            p.dragLin = {0.055f, 0.035f, 0.050f}; break;
+            p.dragLin = {0.055f, 0.035f, 0.050f};
+            p.colliderScale = 1.00f;
+            break;
         case 3:  // 3.5 inch, BabyApe II 6S-style baseline
             p.mass = 0.250f; p.thrustRatio = 5.7f; p.cells = 6; p.capacityMah = 650.f;
             p.packResistance = 0.030f; p.radius = 0.100f; p.armLength = 0.075f; p.motorTau = 0.010f; p.maxMotorRPM = 40000.f; p.rateTau = 0.018f;
             p.yawTau = 0.050f; p.propPitchSpeed = 70.f; p.dragK = {0.010f, 0.010f, 0.008f};
-            p.dragLin = {0.040f, 0.040f, 0.040f}; break;
+            p.dragLin = {0.040f, 0.040f, 0.040f};
+            p.colliderScale = 1.00f;
+            break;
         case 4:  // standard 5 inch freestyle
             p.mass = 0.650f; p.thrustRatio = 7.0f; p.cells = 6; p.capacityMah = 1300.f;
             p.packResistance = 0.030f; p.radius = 0.120f; p.armLength = 0.105f; p.motorTau = 0.025f; p.maxMotorRPM = 30000.f; p.rateTau = 0.022f;
             p.yawTau = 0.050f; p.propPitchSpeed = 70.f; p.dragK = {0.010f, 0.006f, 0.008f};
-            p.dragLin = {0.080f, 0.040f, 0.080f}; break;
+            p.dragLin = {0.080f, 0.040f, 0.080f};
+            p.colliderScale = 1.00f;
+            break;
         default: return;  // Custom leaves every flight-model value untouched.
     }
     p.throttleCurve = 1.7f;
@@ -1219,6 +2012,8 @@ static void changeSetting(const Entry& e, int direction) {
         else if (k.find("expo") != std::string::npos || k == "deadband" || k == "arm_threshold") step = 0.01f;
         else if (k == "cam_tilt_deg") { step = 1.f; lo = -10.f; hi = 80.f; }
         else if (k == "fov_horizontal_deg") { step = 5.f; lo = 60.f; hi = 150.f; }
+        else if (k == "props_opacity") { step = 1.f; lo = 0.f; hi = 100.f; }
+        else if (k == "props_lowering") { step = 5.f; lo = 0.f; hi = 100.f; }
         else if (k == "video_snow_strength")        { step = 0.1f; lo = 0.f; hi = 3.f; }
         else if (k == "video_occlusion_sensitivity"){ step = 0.1f; lo = 0.f; hi = 2.f; }
         else if (k == "video_close_wall_sensitivity"){ step = 0.1f; lo = 0.f; hi = 2.f; }
@@ -1592,6 +2387,623 @@ static float applyDeadband(float x, float db) {
     return (x < 0 ? -1.f : 1.f) * (a - db) / (1.f - db);
 }
 
+// ============================================================ Debug Overlay Shader and Functions
+
+// Simple debug shader for prop overlay - flat color per prop, no blending, no culling
+static const char* DEBUG_PROP_OVERLAY_VS = R"(#version 330 core
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNrm;
+layout(location=2) in vec3 aCol;
+layout(location=3) in float aMat;
+layout(location=4) in float aPropIdx;
+uniform mat4 uVP;
+uniform mat4 uView;
+out vec3 vCol;
+out float vPropIdx;
+void main(){
+    vCol = aCol;
+    vPropIdx = aPropIdx;
+    vec4 viewPos = uView * vec4(aPos, 1.0);
+    gl_Position = uVP * viewPos;
+}
+)";
+
+static const char* DEBUG_PROP_OVERLAY_FS = R"(#version 330 core
+in vec3 vCol;
+in float vPropIdx;
+out vec4 oColor;
+void main(){
+    // Bright distinct colors per prop: 0=red, 1=green, 2=blue, 3=yellow, 4=cyan, 5=magenta
+    int idx = int(vPropIdx + 0.5);
+    vec3 color;
+    if (idx == 0) color = vec3(1.0, 0.0, 0.0);        // prop 0 - red
+    else if (idx == 1) color = vec3(0.0, 1.0, 0.0);    // prop 1 - green
+    else if (idx == 2) color = vec3(0.0, 0.0, 1.0);    // prop 2 - blue
+    else if (idx == 3) color = vec3(1.0, 1.0, 0.0);    // prop 3 - yellow
+    else if (idx == 4) color = vec3(0.0, 1.0, 1.0);    // motors - cyan
+    else if (idx == 5) color = vec3(1.0, 0.0, 1.0);    // arms - magenta
+    else color = vCol;
+    oColor = vec4(color, 1.0);
+}
+)";
+
+static GLuint buildDebugPropOverlayProgram() {
+    return buildProgram(DEBUG_PROP_OVERLAY_VS, DEBUG_PROP_OVERLAY_FS, "debug-prop-overlay");
+}
+
+// Write PPM file
+static void writePPM(const char* filename, int w, int h, const std::vector<uint8_t>& pixels) {
+    FILE* f = std::fopen(filename, "wb");
+    if (!f) return;
+    std::fprintf(f, "P6\n%d %d\n255\n", w, h);
+    std::fwrite(pixels.data(), 1, pixels.size(), f);
+    std::fclose(f);
+}
+
+// Print ASCII art of framebuffer
+static void printASCIIArt(const std::vector<uint8_t>& pixels, int w, int h, int outW, int outH) {
+    std::printf("\n+");
+    for (int i = 0; i < outW; ++i) std::printf("-");
+    std::printf("+\n");
+    
+    for (int row = 0; row < outH; ++row) {
+        std::printf("|");
+        for (int col = 0; col < outW; ++col) {
+            // Sample multiple pixels in the source region
+            int srcX = (col * w) / outW;
+            int srcY = (row * h) / outH;
+            int srcW = std::max(1, w / outW);
+            int srcH = std::max(1, h / outH);
+            
+            int rSum = 0, gSum = 0, bSum = 0, count = 0;
+            for (int sy = 0; sy < srcH && srcY + sy < h; ++sy) {
+                for (int sx = 0; sx < srcW && srcX + sx < w; ++sx) {
+                    int idx = ((srcY + sy) * w + (srcX + sx)) * 3;
+                    rSum += pixels[idx];
+                    gSum += pixels[idx + 1];
+                    bSum += pixels[idx + 2];
+                    count++;
+                }
+            }
+            if (count > 0) {
+                int r = rSum / count;
+                int g = gSum / count;
+                int b = bSum / count;
+                int luminance = (r * 299 + g * 587 + b * 114) / 1000;
+                std::printf("%c", luminance > 32 ? '#' : '.');
+            } else {
+                std::printf(".");
+            }
+        }
+        std::printf("|\n");
+    }
+    
+    std::printf("+");
+    for (int i = 0; i < outW; ++i) std::printf("-");
+    std::printf("+\n");
+}
+
+// Count lit pixels in a region
+static int countLitPixels(const std::vector<uint8_t>& pixels, int w, int h, int x0, int y0, int x1, int y1, int threshold = 32) {
+    int count = 0;
+    for (int y = y0; y < y1 && y < h; ++y) {
+        for (int x = x0; x < x1 && x < w; ++x) {
+            int idx = (y * w + x) * 3;
+            int r = pixels[idx];
+            int g = pixels[idx + 1];
+            int b = pixels[idx + 2];
+            int luminance = (r * 299 + g * 587 + b * 114) / 1000;
+            if (luminance > threshold) count++;
+        }
+    }
+    return count;
+}
+
+// UI Visibility Test: read back framebuffer after OSD and count non-background pixels in UI regions
+static void testUIVisibility(int dw, int dh, const char* label, bool withOverlay, size_t osdVertexCount, int frameCounter) {
+    std::vector<uint8_t> pixels(dw * dh * 4);
+    glReadPixels(0, 0, dw, dh, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    
+    // Define UI regions (in window coordinates, origin bottom-left)
+    // Top-left: throttle, ARMED/DISARMED
+    int tl_x0 = 0, tl_y0 = dh * 3 / 4, tl_x1 = dw / 3, tl_y1 = dh;
+    // Top-center: timer
+    int tc_x0 = dw / 3, tc_y0 = dh * 3 / 4, tc_x1 = dw * 2 / 3, tc_y1 = dh;
+    // Top-right: FPS, tilt, FOV
+    int tr_x0 = dw * 2 / 3, tr_y0 = dh * 3 / 4, tr_x1 = dw, tr_y1 = dh;
+    // Bottom-left: battery voltage, cell voltage, MAH
+    int bl_x0 = 0, bl_y0 = 0, bl_x1 = dw / 3, bl_y1 = dh / 4;
+    // Bottom-right: speed, altitude
+    int br_x0 = dw * 2 / 3, br_y0 = 0, br_x1 = dw, br_y1 = dh / 4;
+    
+    auto countBright = [&](int x0, int y0, int x1, int y1) {
+        int count = 0;
+        for (int y = y0; y < y1 && y < dh; ++y) {
+            for (int x = x0; x < x1 && x < dw; ++x) {
+                int idx = (y * dw + x) * 4;
+                // OSD text is white/bright (r,g,b > 200). Scene is darker.
+                if (pixels[idx] > 200 && pixels[idx+1] > 200 && pixels[idx+2] > 200) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    };
+    
+    int tl_count = countBright(tl_x0, tl_y0, tl_x1, tl_y1);
+    int tc_count = countBright(tc_x0, tc_y0, tc_x1, tc_y1);
+    int tr_count = countBright(tr_x0, tr_y0, tr_x1, tr_y1);
+    int bl_count = countBright(bl_x0, bl_y0, bl_x1, bl_y1);
+    int br_count = countBright(br_x0, br_y0, br_x1, br_y1);
+    
+    std::printf("\n=== UI VISIBILITY TEST: %s (overlay=%s, osd_verts=%zu) ===\n", label, withOverlay ? "ON" : "OFF", osdVertexCount);
+    std::printf("  Top-left (throttle):    %d bright pixels\n", tl_count);
+    std::printf("  Top-center (timer):     %d bright pixels\n", tc_count);
+    std::printf("  Top-right (FPS/tilt):   %d bright pixels\n", tr_count);
+    std::printf("  Bottom-left (battery):  %d bright pixels\n", bl_count);
+    std::printf("  Bottom-right (speed):   %d bright pixels\n", br_count);
+    std::printf("=== END UI VISIBILITY TEST ===\n\n");
+}
+
+// Debug overlay render and analysis
+static void debugRenderPropOverlay(
+    const Sim& sim,
+    const Config& cfg,
+    GLuint vaoPropOverlay,
+    GLsizei propOverlayMeshVerts,
+    int windowWidth,
+    int windowHeight,
+    GLuint debugFbo,
+    GLuint debugTex,
+    GLuint debugDepth
+) {
+    // Test cases: FOV 160/tilt 33, FOV 120/tilt 33, FOV 90/tilt 20
+    struct TestCase { float fov; float tilt; const char* name; };
+    TestCase testCases[] = {
+        {160.f, 33.f, "FOV160_Tilt33"},
+    };
+    
+    // Build debug shader program
+    GLuint debugProg = buildDebugPropOverlayProgram();
+    GLint uDebugVP = gl.glGetUniformLocation(debugProg, "uVP");
+    GLint uDebugView = gl.glGetUniformLocation(debugProg, "uView");
+    
+    // Camera mount geometry (from drone preset) - MATCH MAIN CAMERA: {0, 0.03f, -0.07f}
+    float armLen = sim.P.armLength;
+    float armCoord = armLen * 0.70710678f;
+    float bodyHeight = 0.025f;
+    float bodyDepth = armLen * 0.25f;
+    float motorHeight = 0.02f;
+    float cameraSize = armLen * 0.15f;
+    V3 camLocalPos = {0, 0.03f, -0.07f};
+    
+    // Ensure front props are IN FRONT of camera for visibility (same logic as buildPropOverlayMesh)
+    float propZ = std::min(-armCoord, camLocalPos.z - 0.03f); // 3cm in front of camera
+    V3 propPositions[4] = {
+        { armCoord, motorHeight + 0.002f, propZ }, // front-right
+        {-armCoord, motorHeight + 0.002f, propZ }, // front-left
+        {-armCoord, motorHeight + 0.002f,  armCoord }, // back-left
+        { armCoord, motorHeight + 0.002f,  armCoord }, // back-right
+    };
+    
+    // Prop radius from preset
+    float propRadius = armLen * 0.45f; // 5" = ~63mm, 3.5" = ~45mm
+    
+    std::printf("\n========== DEBUG PROP OVERLAY ANALYSIS ==========\n");
+    std::printf("Camera mount: offset=(%.3f, %.3f, %.3f) tilt=%.1f deg\n", 
+                camLocalPos.x, camLocalPos.y, camLocalPos.z, cfg.camTilt);
+    std::printf("Arm length: %.3f m, Arm coord: %.3f m\n", armLen, armCoord);
+    std::printf("Prop radius: %.3f m (%.1f mm)\n", propRadius, propRadius * 1000.f);
+    std::printf("Motor height: %.3f m\n", motorHeight);
+    std::printf("Body height: %.3f m, Body depth: %.3f m, Camera size: %.3f m\n", bodyHeight, bodyDepth, cameraSize);
+    std::printf("\nProp positions relative to body (drone-local):\n");
+    for (int i = 0; i < 4; ++i) {
+        std::printf("  Prop %d: (%.3f, %.3f, %.3f)\n", i, propPositions[i].x, propPositions[i].y, propPositions[i].z);
+    }
+    std::printf("Camera position (drone-local): (%.3f, %.3f, %.3f)\n", camLocalPos.x, camLocalPos.y, camLocalPos.z);
+    
+    for (const auto& tc : testCases) {
+        std::printf("\n--- Test Case: %s (FOV=%.0f, Tilt=%.0f) ---\n", tc.name, tc.fov, tc.tilt);
+        
+        // Overlay projection: same FOV/aspect, near=0.002, far=1.0
+        float aspect = (float)windowWidth / (float)windowHeight;
+        float tanH = std::tan(rad(tc.fov) * 0.5f);
+        float tanV = tanH / aspect;
+        float overlayNear = 0.002f;
+        float overlayFar = 1.0f;
+        float P_overlay[16] = {0};
+        P_overlay[0] = 1.f / tanH;
+        P_overlay[5] = 1.f / tanV;
+        P_overlay[10] = (overlayFar + overlayNear) / (overlayNear - overlayFar);
+        P_overlay[11] = -1.f;
+        P_overlay[14] = 2.f * overlayFar * overlayNear / (overlayNear - overlayFar);
+        
+        // Main projection (for comparison) - computed but not used in this debug function
+        float mainNear = 0.05f;
+        float mainFar = 210.f; // qualityFar[0]
+        float P_main[16] = {0};
+        (void)P_main;
+        P_main[0] = 1.f / tanH;
+        P_main[5] = 1.f / tanV;
+        P_main[10] = (mainFar + mainNear) / (mainNear - mainFar);
+        P_main[11] = -1.f;
+        P_main[14] = 2.f * mainFar * mainNear / (mainNear - mainFar);
+        
+        // View matrix (camera tilt only, no translation)
+        float tiltRad = rad(tc.tilt);
+        float cosT = cosf(tiltRad);
+        float sinT = sinf(tiltRad);
+        V3 overlayRight = {1, 0, 0};
+        V3 overlayUp = {0, cosT, sinT};
+        V3 overlayBack = {0, -sinT, cosT};
+        float view[16] = {
+            overlayRight.x, overlayUp.x, overlayBack.x, 0,
+            overlayRight.y, overlayUp.y, overlayBack.y, 0,
+            overlayRight.z, overlayUp.z, overlayBack.z, 0,
+            -dot(overlayRight, camLocalPos), -dot(overlayUp, camLocalPos), -dot(overlayBack, camLocalPos), 1
+        };
+        
+        std::printf("Overlay projection: near=%.3f, far=%.3f, FOV=%.0f, aspect=%.3f\n", overlayNear, overlayFar, tc.fov, aspect);
+        std::printf("Main projection:    near=%.3f, far=%.3f, FOV=%.0f, aspect=%.3f\n", mainNear, mainFar, tc.fov, aspect);
+        
+        // Transform prop positions to camera space and NDC
+        std::printf("\nProp analysis:\n");
+        for (int i = 0; i < 4; ++i) {
+            V3 relPos = {propPositions[i].x - camLocalPos.x, propPositions[i].y - camLocalPos.y, propPositions[i].z - camLocalPos.z};
+            float cx = dot(overlayRight, relPos);
+            float cy = dot(overlayUp, relPos);
+            float cz = dot(overlayBack, relPos);
+            float dist = std::sqrt(cx*cx + cy*cy + cz*cz);
+            
+            // NDC with overlay projection
+            float ndcX_overlay = cx / (-cz * tanH);
+            float ndcY_overlay = cy / (-cz * tanV);
+            
+            // NDC with main projection
+            float ndcX_main = cx / (-cz * tanH);
+            float ndcY_main = cy / (-cz * tanV);
+            
+            // Check near plane clipping
+            bool clipped_overlay = (-cz) < overlayNear;
+            bool clipped_main = (-cz) < mainNear;
+            
+            std::printf("  Prop %d: cam=(%.3f, %.3f, %.3f) dist=%.3f NDC_overlay=(%.3f, %.3f) NDC_main=(%.3f, %.3f) clip_overlay=%s clip_main=%s\n",
+                        i, cx, cy, cz, dist, ndcX_overlay, ndcY_overlay, ndcX_main, ndcY_main,
+                        clipped_overlay ? "YES" : "NO", clipped_main ? "YES" : "NO");
+        }
+        
+        // Resize debug framebuffer to window size
+        glBindTexture(GL_TEXTURE_2D, debugTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, windowWidth, windowHeight, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        
+        gl.glBindRenderbuffer(GL_RENDERBUFFER, debugDepth);
+        gl.glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, windowWidth, windowHeight);
+        
+        gl.glBindFramebuffer(GL_FRAMEBUFFER, debugFbo);
+        gl.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, debugTex, 0);
+        gl.glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, debugDepth);
+        
+        GLenum status = gl.glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        if (status != GL_FRAMEBUFFER_COMPLETE) {
+            std::printf("ERROR: Debug framebuffer incomplete: 0x%X\n", status);
+        }
+        
+        // Render to debug framebuffer
+        glViewport(0, 0, windowWidth, windowHeight);
+        gl.glBindFramebuffer(GL_FRAMEBUFFER, debugFbo);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        
+        // Disable culling, blending for debug
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_BLEND);
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LEQUAL);
+        glDepthMask(GL_TRUE);
+        
+        // Use debug shader
+        gl.glUseProgram(debugProg);
+        gl.glUniformMatrix4fv(uDebugVP, 1, GL_FALSE, P_overlay);
+        gl.glUniformMatrix4fv(uDebugView, 1, GL_FALSE, view);
+        
+        // Draw the geometry
+        gl.glBindVertexArray(vaoPropOverlay);
+        glDrawArrays(GL_TRIANGLES, 0, propOverlayMeshVerts);
+        
+        // Read back framebuffer
+        std::vector<uint8_t> pixels(windowWidth * windowHeight * 3);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glReadPixels(0, 0, windowWidth, windowHeight, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
+        
+        // Flip vertically (OpenGL origin is bottom-left)
+        for (int y = 0; y < windowHeight / 2; ++y) {
+            int y2 = windowHeight - 1 - y;
+            for (int x = 0; x < windowWidth; ++x) {
+                int idx1 = (y * windowWidth + x) * 3;
+                int idx2 = (y2 * windowWidth + x) * 3;
+                std::swap(pixels[idx1], pixels[idx2]);
+                std::swap(pixels[idx1 + 1], pixels[idx2 + 1]);
+                std::swap(pixels[idx1 + 2], pixels[idx2 + 2]);
+            }
+        }
+        
+        // Save PPM
+        char ppmName[64];
+        std::snprintf(ppmName, sizeof(ppmName), "overlay_debug_%s.ppm", tc.name);
+        writePPM(ppmName, windowWidth, windowHeight, pixels);
+        std::printf("Saved %s\n", ppmName);
+        
+        // Print ASCII art (downsampled to 100x40)
+        std::printf("\nASCII art (100x40):\n");
+        printASCIIArt(pixels, windowWidth, windowHeight, 100, 40);
+        
+        // Count lit pixels in regions
+        int lowerHalf = countLitPixels(pixels, windowWidth, windowHeight, 0, windowHeight/2, windowWidth, windowHeight);
+        int middleRegion = countLitPixels(pixels, windowWidth, windowHeight, 
+                                          windowWidth*4/10, windowHeight*4/10, 
+                                          windowWidth*6/10, windowHeight*6/10);
+        int lowerLeft = countLitPixels(pixels, windowWidth, windowHeight, 0, windowHeight/2, windowWidth/2, windowHeight);
+        int lowerRight = countLitPixels(pixels, windowWidth, windowHeight, windowWidth/2, windowHeight/2, windowWidth, windowHeight);
+        
+        std::printf("\nLit pixel counts:\n");
+        std::printf("  Lower half: %d\n", lowerHalf);
+        std::printf("  Middle region (center 20%%): %d\n", middleRegion);
+        std::printf("  Lower-left corner: %d\n", lowerLeft);
+        std::printf("  Lower-right corner: %d\n", lowerRight);
+        std::printf("  Expected: many in lower half, almost none in middle\n");
+        
+        // Cleanup - don't delete framebuffer handles (managed by main)
+        gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        gl.glDeleteProgram(debugProg);
+    }
+    
+    std::printf("\n========== END DEBUG PROP OVERLAY ANALYSIS ==========\n\n");
+}
+
+// ============================================================ Props Lowering Verification
+static void verifyPropsLowering(
+    const Sim& sim,
+    GLuint vaoPropOverlay,
+    GLsizei propOverlayMeshVerts,
+    int windowWidth,
+    int windowHeight,
+    GLuint debugFbo,
+    GLuint debugTex,
+    GLuint debugDepth
+) {
+    std::printf("\n========== PROPS LOWERING VERIFICATION ==========\n");
+    
+    // Build debug shader program for flat color rendering
+    GLuint debugProg = buildDebugPropOverlayProgram();
+    GLint uDebugVP = gl.glGetUniformLocation(debugProg, "uVP");
+    GLint uDebugView = gl.glGetUniformLocation(debugProg, "uView");
+    
+    // Camera mount geometry
+    float armLen = sim.P.armLength;
+    (void)armLen;  // unused in this function but kept for reference
+    V3 camLocalPos = {0, 0.03f, -0.07f};
+    
+    // Test cases: FOV 90, 120, 160 with tilt 20, 33
+    struct TestConfig { float fov; float tilt; const char* name; };
+    TestConfig testConfigs[] = {
+        {90.f, 20.f, "FOV90_Tilt20"},
+        {90.f, 33.f, "FOV90_Tilt33"},
+        {120.f, 20.f, "FOV120_Tilt20"},
+        {120.f, 33.f, "FOV120_Tilt33"},
+        {160.f, 20.f, "FOV160_Tilt20"},
+        {160.f, 33.f, "FOV160_Tilt33"},
+    };
+    
+    // Lowering percentages to test
+    float loweringPercents[] = {0.f, 25.f, 50.f, 75.f, 100.f};
+    
+    // Results storage
+    int results[6][5][2] = {}; // [config][pct][0=LL, 1=LR]
+    
+    // Resize debug framebuffer to window size
+    glBindTexture(GL_TEXTURE_2D, debugTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, windowWidth, windowHeight, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    
+    gl.glBindRenderbuffer(GL_RENDERBUFFER, debugDepth);
+    gl.glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, windowWidth, windowHeight);
+    
+    gl.glBindFramebuffer(GL_FRAMEBUFFER, debugFbo);
+    gl.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, debugTex, 0);
+    gl.glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, debugDepth);
+    
+    GLenum status = gl.glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        std::printf("ERROR: Debug framebuffer incomplete: 0x%X\n", status);
+    }
+    
+    // Print table header
+    std::printf("\n=== LIT PIXEL COUNTS IN LOWER CORNERS ===\n");
+    std::printf("%-20s | ", "Config");
+    for (float pct : loweringPercents) {
+        std::printf(" %3.0f%%    ", pct);
+    }
+    std::printf("\n");
+    std::printf("%-20s | ", "");
+    for (size_t i = 0; i < 5; ++i) std::printf("LL     LR     ");
+    std::printf("\n");
+    std::printf("-------------------------------------------------------------\n");
+    
+    // For ASCII dumps at FOV 160 / tilt 33
+    const float asciiFov = 160.f;
+    const float asciiTilt = 33.f;
+    float asciiPercents[] = {0.f, 50.f, 100.f};
+    
+    for (int ci = 0; ci < 6; ++ci) {
+        const auto& tc = testConfigs[ci];
+        float aspect = (float)windowWidth / (float)windowHeight;
+        float tanH = std::tan(rad(tc.fov) * 0.5f);
+        float tanV = tanH / aspect;
+        float verticalHalfFOV = std::atan(tanV);  // radians
+        
+        // Print computed angles for this config
+        std::printf("\nConfig: %s (FOV=%.0f, Tilt=%.0f, vertHalfFOV=%.1f deg)\n", 
+                    tc.name, tc.fov, tc.tilt, verticalHalfFOV * 180.f / M_PI);
+        std::printf("  Lowering%% -> Angle(deg) = (pct/100) * (%.1f + 20.0)\n", 
+                    verticalHalfFOV * 180.f / M_PI);
+        
+        for (int pi = 0; pi < 5; ++pi) {
+            float pct = loweringPercents[pi];
+            float loweringAngleRad = (pct / 100.0f) * (verticalHalfFOV + rad(20.0f));
+            float loweringAngleDeg = loweringAngleRad * 180.f / M_PI;
+            
+            // Build view matrix with lowering
+            float tiltRad = rad(tc.tilt);
+            float totalTiltRad = tiltRad + loweringAngleRad;
+            float cosT = cosf(totalTiltRad);
+            float sinT = sinf(totalTiltRad);
+            V3 overlayRight = {1, 0, 0};
+            V3 overlayUp = {0, cosT, sinT};
+            V3 overlayBack = {0, -sinT, cosT};
+            float view[16] = {
+                overlayRight.x, overlayUp.x, overlayBack.x, 0,
+                overlayRight.y, overlayUp.y, overlayBack.y, 0,
+                overlayRight.z, overlayUp.z, overlayBack.z, 0,
+                -dot(overlayRight, camLocalPos), -dot(overlayUp, camLocalPos), -dot(overlayBack, camLocalPos), 1
+            };
+            
+            // Overlay projection
+            float overlayNear = 0.002f;
+            float overlayFar = 1.0f;
+            float P_overlay[16] = {0};
+            P_overlay[0] = 1.f / tanH;
+            P_overlay[5] = 1.f / tanV;
+            P_overlay[10] = (overlayFar + overlayNear) / (overlayNear - overlayFar);
+            P_overlay[11] = -1.f;
+            P_overlay[14] = 2.f * overlayFar * overlayNear / (overlayNear - overlayFar);
+            
+            // Render to debug framebuffer
+            glViewport(0, 0, windowWidth, windowHeight);
+            gl.glBindFramebuffer(GL_FRAMEBUFFER, debugFbo);
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            
+            glDisable(GL_CULL_FACE);
+            glDisable(GL_BLEND);
+            glEnable(GL_DEPTH_TEST);
+            glDepthFunc(GL_LEQUAL);
+            glDepthMask(GL_TRUE);
+            
+            gl.glUseProgram(debugProg);
+            gl.glUniformMatrix4fv(uDebugVP, 1, GL_FALSE, P_overlay);
+            gl.glUniformMatrix4fv(uDebugView, 1, GL_FALSE, view);
+            
+            gl.glBindVertexArray(vaoPropOverlay);
+            glDrawArrays(GL_TRIANGLES, 0, propOverlayMeshVerts);
+            
+            // Read back framebuffer
+            std::vector<uint8_t> pixels(windowWidth * windowHeight * 3);
+            glFinish();  // Ensure rendering is complete
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);  // Ensure proper pixel packing
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+            glReadPixels(0, 0, windowWidth, windowHeight, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
+            
+            // Flip vertically (OpenGL origin is bottom-left)
+            for (int y = 0; y < windowHeight / 2; ++y) {
+                int y2 = windowHeight - 1 - y;
+                for (int x = 0; x < windowWidth; ++x) {
+                    int idx1 = (y * windowWidth + x) * 3;
+                    int idx2 = (y2 * windowWidth + x) * 3;
+                    std::swap(pixels[idx1], pixels[idx2]);
+                    std::swap(pixels[idx1 + 1], pixels[idx2 + 1]);
+                    std::swap(pixels[idx1 + 2], pixels[idx2 + 2]);
+                }
+            }
+            
+            // Count lit pixels in lower-left and lower-right corners (bottom 25% of screen)
+            int cornerHeight = windowHeight / 4;
+            int cornerWidth = windowWidth / 4;
+            int lowerLeft = countLitPixels(pixels, windowWidth, windowHeight, 
+                                           0, 0, cornerWidth, cornerHeight);
+            int lowerRight = countLitPixels(pixels, windowWidth, windowHeight, 
+                                            windowWidth - cornerWidth, 0, windowWidth, cornerHeight);
+            
+            // Store for table
+            results[ci][pi][0] = lowerLeft;
+            results[ci][pi][1] = lowerRight;
+            
+            // Print computed angle for this percentage
+            std::printf("  %3.0f%% -> %.2f deg, LL=%d, LR=%d\n", pct, loweringAngleDeg, lowerLeft, lowerRight);
+            
+            // ASCII dump for specific configs (FOV 160 / tilt 33 at 0%, 50%, 100%)
+            if (tc.fov == asciiFov && tc.tilt == asciiTilt) {
+                for (float apct : asciiPercents) {
+                    if (std::fabs(pct - apct) < 0.01f) {
+                        std::printf("\n--- ASCII DUMP: %s, Lowering=%.0f%%, Angle=%.2f deg ---\n", 
+                                    tc.name, pct, loweringAngleDeg);
+                        printASCIIArt(pixels, windowWidth, windowHeight, 100, 40);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Print summary table
+    std::printf("\n=== SUMMARY TABLE: Lower-Left / Lower-Right Lit Pixels ===\n");
+    for (int ci = 0; ci < 6; ++ci) {
+        std::printf("%-20s | ", testConfigs[ci].name);
+        for (int pi = 0; pi < 5; ++pi) {
+            std::printf("%4d %4d  ", results[ci][pi][0], results[ci][pi][1]);
+        }
+        std::printf("\n");
+    }
+    
+    // Verify monotonic decrease and zero at 100%
+    std::printf("\n=== VERIFICATION: Monotonic decrease to zero at 100%% ===\n");
+    bool allOk = true;
+    for (int ci = 0; ci < 6; ++ci) {
+        for (int corner = 0; corner < 2; ++corner) {
+            const char* cornerName = corner == 0 ? "LL" : "LR";
+            int prev = results[ci][0][corner];
+            bool ok = true;
+            for (int pi = 1; pi < 5; ++pi) {
+                int curr = results[ci][pi][corner];
+                if (curr > prev) {
+                    ok = false;
+                    allOk = false;
+                    std::printf("  FAIL: %s %s: %.0f%% (%d) > %.0f%% (%d)\n", 
+                                testConfigs[ci].name, cornerName, 
+                                loweringPercents[pi], curr, 
+                                loweringPercents[pi-1], prev);
+                }
+                prev = curr;
+            }
+            // Check zero at 100%
+            if (results[ci][4][corner] != 0) {
+                ok = false;
+                allOk = false;
+                std::printf("  FAIL: %s %s at 100%%: %d != 0\n", 
+                            testConfigs[ci].name, cornerName, results[ci][4][corner]);
+            }
+            if (ok) {
+                std::printf("  OK: %s %s monotonically decreases to 0\n", 
+                            testConfigs[ci].name, cornerName);
+            }
+        }
+    }
+    if (allOk) {
+        std::printf("\nALL VERIFICATIONS PASSED\n");
+    } else {
+        std::printf("\nSOME VERIFICATIONS FAILED\n");
+    }
+    
+    // Cleanup - don't delete framebuffer handles (managed by main)
+    gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (debugProg) {
+        gl.glDeleteProgram(debugProg);
+    }
+    
+    std::printf("\n========== END PROPS LOWERING VERIFICATION ==========\n\n");
+}
+
 // ============================================================ main
 int main(int argc, char** argv) {
     Config cfg;
@@ -1615,6 +3027,10 @@ int main(int argc, char** argv) {
     bool dbgDisableShadows = false;
     bool disableVideo = false;
     int startMapIndex = -1;
+    bool debugMode = false;
+    bool debugOverlay = false;
+    bool debugGlState = false;
+    bool debugPropsLowering = false;
     // Ground layer toggles
     bool disableGroundLayer0 = false;
     bool disableGroundLayer1 = false;
@@ -1671,6 +3087,9 @@ int main(int argc, char** argv) {
         else if (a == "--disable-video") {
             disableVideo = true;
         }
+        else if (a == "--debug-gl-state") {
+            debugGlState = true;
+        }
         else if (a == "--map" && i + 1 < argc) {
             startMapIndex = std::stoi(argv[++i]);
         }
@@ -1693,10 +3112,20 @@ int main(int argc, char** argv) {
                 case 7: disableGroundLayer7 = true; break;
             }
         }
+        else if (a == "--debug") {
+            debugMode = true;
+        }
+        else if (a == "--debug-overlay") {
+            debugOverlay = true;
+        }
+        else if (a == "--debug-props-lowering") {
+            debugPropsLowering = true;
+        }
         else if (a == "--help" || a == "-h") {
             std::printf("wenafpv [--config FILE] [--list-joysticks] [--fonttest] [--generate [SEED] [OUTPUT]]\n"
                         "                   [--freeze-test [FRAMES]] [--frame-diff-test [FRAMES]] [--draw-call-audit]\n"
-                        "                   [--ground-audit] [--color-census] [--disable-ground-layer N]\n"
+                        "                   [--ground-audit] [--color-census] [--disable-ground-layer N] [--debug] [--debug-overlay]\n"
+                        "                   [--debug-props-lowering] [--debug-gl-state]\n"
                         "Config: %s\n"
                         "Keys: F1 RC input visualizer | C analog video on/off | F3/F4 previous/next map | F5 settings | R reset | [ ] tilt | - = FOV | F11 fullscreen\n"
                         "      F2 force keyboard | ESC quit | keyboard: W/S throttle, A/D yaw, arrows pitch/roll, SPACE arm\n"
@@ -1769,11 +3198,18 @@ int main(int argc, char** argv) {
     }
     Uint32 wflags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE;
     if (cfg.fullscreen) wflags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+    // Wayland/Hyprland fix: set hints before window creation
+    SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
+    SDL_SetHint(SDL_HINT_VIDEO_WAYLAND_PREFER_LIBDECOR, "0");
+    
     SDL_Window* win = SDL_CreateWindow("WenaFPV", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, cfg.width, cfg.height, wflags);
     if (!win) {
         std::fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
         return 1;
     }
+    // Ensure window gets keyboard focus on Wayland
+    SDL_RaiseWindow(win);
+    SDL_SetWindowInputFocus(win);
     SDL_GLContext ctx = SDL_GL_CreateContext(win);
     if (!ctx) {
         std::fprintf(stderr, "OpenGL 3.3 core context failed: %s\n", SDL_GetError());
@@ -1789,6 +3225,8 @@ int main(int argc, char** argv) {
     GLuint progSky = buildProgram(SKY_VS, SKY_FS, "sky");
     GLuint progVideo = buildProgram(SKY_VS, VIDEO_FS, "analog-video");
     GLuint progOsd = buildProgram(OSD_VS, OSD_FS, "osd");
+    GLuint progDroneShadow = buildProgram(DRONE_SHADOW_VS, DRONE_SHADOW_FS, "drone-shadow");
+    GLuint progPropOverlay = buildProgram(PROP_OVERLAY_VS, PROP_OVERLAY_FS, "prop-overlay");
     GLint uVP = gl.glGetUniformLocation(progWorld, "uVP");
     GLint uCam = gl.glGetUniformLocation(progWorld, "uCam");
     GLint uFog = gl.glGetUniformLocation(progWorld, "uFog");
@@ -1805,6 +3243,25 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
     GLint uShadowNormalOffset = gl.glGetUniformLocation(progWorld, "uShadowNormalOffset");
     GLint uShadowFilter = gl.glGetUniformLocation(progWorld, "uShadowFilter");
     GLint uShadowsEnabled = gl.glGetUniformLocation(progWorld, "uShadowsEnabled");
+    // Drone shadow uniforms
+    GLint uDroneShadowVP = gl.glGetUniformLocation(progDroneShadow, "uVP");
+    GLint uDroneShadowModel = gl.glGetUniformLocation(progDroneShadow, "uModel");
+    GLint uDroneShadowSunDir = gl.glGetUniformLocation(progDroneShadow, "uSunDir");
+    GLint uDroneShadowHeight = gl.glGetUniformLocation(progDroneShadow, "uShadowHeight");
+    GLint uDroneShadowPlaneNormal = gl.glGetUniformLocation(progDroneShadow, "uPlaneNormal");
+    // Prop overlay uniforms
+    GLint uPropOverlayVP = gl.glGetUniformLocation(progPropOverlay, "uVP");
+    GLint uPropOverlayView = gl.glGetUniformLocation(progPropOverlay, "uView");
+    GLint uPropOverlayTime = gl.glGetUniformLocation(progPropOverlay, "uTime");
+    GLint uPropOverlayRPM[4];
+    for (int i = 0; i < 4; ++i) {
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "uRPM[%d]", i);
+        uPropOverlayRPM[i] = gl.glGetUniformLocation(progPropOverlay, buf);
+    }
+    GLint uPropOverlayOpacity = gl.glGetUniformLocation(progPropOverlay, "uOpacity");
+    GLint uPropOverlayBlades = gl.glGetUniformLocation(progPropOverlay, "uBlades");
+    GLint uPropOverlaySunDir = gl.glGetUniformLocation(progPropOverlay, "uSunDir");
     // Debug uniforms for flickering investigation
     GLint uDbgDisableHash21 = gl.glGetUniformLocation(progWorld, "uDbgDisableHash21");
     GLint uDbgDisableGrain = gl.glGetUniformLocation(progWorld, "uDbgDisableGrain");
@@ -1864,6 +3321,13 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
     int shadowMapSize = 0;
     gl.glGenFramebuffers(1, &shadowFbo);
     glGenTextures(1, &shadowDepthTexture);
+    
+    // Debug framebuffer for prop overlay verification (created early to avoid GL issues)
+    GLuint debugFbo = 0, debugTex = 0, debugDepth = 0;
+    gl.glGenFramebuffers(1, &debugFbo);
+    glGenTextures(1, &debugTex);
+    gl.glGenRenderbuffers(1, &debugDepth);
+    
     auto resizeShadowTarget = [&](int resolution) {
         resolution = resolution <= 512 ? 512 : (resolution <= 1024 ? 1024 : 2048);
         if (resolution == shadowMapSize) return;
@@ -1902,12 +3366,12 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
         gl.glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, sceneDepth);
         if (cfg.msaa > 1) {
             gl.glBindRenderbuffer(GL_RENDERBUFFER, sceneDepth);
-            gl.glRenderbufferStorageMultisample(GL_RENDERBUFFER, cfg.msaa, GL_DEPTH_COMPONENT24, width, height);
+            gl.glRenderbufferStorageMultisample(GL_RENDERBUFFER, cfg.msaa, GL_DEPTH24_STENCIL8, width, height);
             gl.glBindRenderbuffer(GL_RENDERBUFFER, sceneColorMsaa);
             gl.glRenderbufferStorageMultisample(GL_RENDERBUFFER, cfg.msaa, GL_RGBA8, width, height);
             gl.glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, sceneColorMsaa);
         } else {
-            gl.glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, width, height);
+            gl.glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
             gl.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sceneColor, 0);
         }
         if (gl.glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
@@ -1978,6 +3442,236 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
     gl.glEnableVertexAttribArray(3);
     gl.glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 10 * sizeof(float), (void*)(9 * sizeof(float)));
 
+    // Drone mesh for shadow
+    std::vector<float> droneMesh = buildDroneMesh(sim.P);
+    GLsizei droneMeshVerts = (GLsizei)(droneMesh.size() / 10);
+    GLuint vaoDrone, vboDrone;
+    gl.glGenVertexArrays(1, &vaoDrone);
+    gl.glBindVertexArray(vaoDrone);
+    gl.glGenBuffers(1, &vboDrone);
+    gl.glBindBuffer(GL_ARRAY_BUFFER, vboDrone);
+    gl.glBufferData(GL_ARRAY_BUFFER, droneMesh.size() * sizeof(float), droneMesh.data(), GL_STATIC_DRAW);
+    gl.glEnableVertexAttribArray(0);
+    gl.glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 10 * sizeof(float), (void*)0);
+    gl.glEnableVertexAttribArray(1);
+    gl.glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 10 * sizeof(float), (void*)(3 * sizeof(float)));
+    gl.glEnableVertexAttribArray(2);
+    gl.glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 10 * sizeof(float), (void*)(6 * sizeof(float)));
+    gl.glEnableVertexAttribArray(3);
+    gl.glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 10 * sizeof(float), (void*)(9 * sizeof(float)));
+    
+    // Print triangle counts for both presets for verification
+    DroneParams p35 = sim.P; // 3.5" preset has armLength=0.075
+    p35.armLength = 0.075f;
+    std::vector<float> droneMesh35 = buildDroneMesh(p35);
+    std::printf("Drone mesh triangles: %d (3.5\" preset, armLen=%.3fm)\n", (int)(droneMesh35.size() / 30), p35.armLength);
+    
+    DroneParams p5 = sim.P; // 5" preset has armLength=0.105
+    p5.armLength = 0.105f;
+    std::vector<float> droneMesh5 = buildDroneMesh(p5);
+    std::printf("Drone mesh triangles: %d (5\" preset, armLen=%.3fm)\n", (int)(droneMesh5.size() / 30), p5.armLength);
+    
+    // Propeller overlay mesh (for FPV camera view)
+    std::vector<float> propOverlayMesh = buildPropOverlayMesh(sim.P);
+    GLsizei propOverlayMeshVerts = (GLsizei)(propOverlayMesh.size() / 11);
+    GLuint vaoPropOverlay, vboPropOverlay;
+    gl.glGenVertexArrays(1, &vaoPropOverlay);
+    gl.glBindVertexArray(vaoPropOverlay);
+    gl.glGenBuffers(1, &vboPropOverlay);
+    gl.glBindBuffer(GL_ARRAY_BUFFER, vboPropOverlay);
+    gl.glBufferData(GL_ARRAY_BUFFER, propOverlayMesh.size() * sizeof(float), propOverlayMesh.data(), GL_STATIC_DRAW);
+    gl.glEnableVertexAttribArray(0);
+    gl.glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 11 * sizeof(float), (void*)0);
+    gl.glEnableVertexAttribArray(1);
+    gl.glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 11 * sizeof(float), (void*)(3 * sizeof(float)));
+    gl.glEnableVertexAttribArray(2);
+    gl.glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 11 * sizeof(float), (void*)(6 * sizeof(float)));
+    gl.glEnableVertexAttribArray(3);
+    gl.glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 11 * sizeof(float), (void*)(9 * sizeof(float)));
+    gl.glEnableVertexAttribArray(4);
+    gl.glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, 11 * sizeof(float), (void*)(10 * sizeof(float)));
+    std::printf("Prop overlay mesh triangles: %d\n", propOverlayMeshVerts / 3);
+    
+    // Projection test: print prop center screen positions for various FOV/tilt combinations
+    // Prop positions in drone-local frame (same as in buildPropOverlayMesh)
+    float armLen = sim.P.armLength;
+    float armCoord = armLen * 0.70710678f;
+    // float bodyHeight = 0.025f;  // unused in this function
+    // float bodyDepth = armLen * 0.25f;  // unused in this function
+    float motorHeight = 0.02f;
+    // float cameraSize = armLen * 0.15f;  // unused in this function
+    // Camera mount offset - MATCH MAIN CAMERA: {0, 0.03f, -0.07f}
+    V3 camLocalPos = {0, 0.03f, -0.07f};
+    V3 propPositions[4] = {
+        { armCoord, motorHeight + 0.002f, -armCoord }, // front-right
+        {-armCoord, motorHeight + 0.002f, -armCoord }, // front-left
+        {-armCoord, motorHeight + 0.002f,  armCoord }, // back-left
+        { armCoord, motorHeight + 0.002f,  armCoord }, // back-right
+    };
+    
+    // Test FOV and tilt combinations
+    float testFovs[] = {90.f, 120.f, 160.f};
+    float testTilts[] = {0.f, 20.f, 33.f, 45.f};
+    if (debugMode) {
+        std::printf("\n=== PROP OVERLAY PROJECTION TEST ===\n");
+        std::printf("Camera local pos: (%.3f, %.3f, %.3f)\n", camLocalPos.x, camLocalPos.y, camLocalPos.z);
+        std::printf("Prop positions (drone-local):\n");
+        for (int i = 0; i < 4; ++i) {
+            std::printf("  Prop %d: (%.3f, %.3f, %.3f)\n", i, propPositions[i].x, propPositions[i].y, propPositions[i].z);
+        }
+        std::printf("\n");
+        
+        for (float fov : testFovs) {
+            float tanH = std::tan(rad(fov) * 0.5f);
+            for (float tilt : testTilts) {
+                float tiltRad = rad(tilt);
+                float cosT = cosf(tiltRad);
+                float sinT = sinf(tiltRad);
+                // View matrix (camera tilt only, no translation)
+                V3 overlayRight = {1, 0, 0};
+                V3 overlayUp = {0, cosT, sinT};
+                V3 overlayBack = {0, -sinT, cosT};
+                
+                std::printf("FOV %.0f  Tilt %.0f:\n", fov, tilt);
+                int visibleCount = 0;
+                for (int i = 0; i < 4; ++i) {
+                    // Transform prop position to camera-local coordinates
+                    V3 relPos = {propPositions[i].x - camLocalPos.x, propPositions[i].y - camLocalPos.y, propPositions[i].z - camLocalPos.z};
+                    // Apply camera tilt (view matrix R^T)
+                    float cx = dot(overlayRight, relPos);
+                    float cy = dot(overlayUp, relPos);
+                    float cz = dot(overlayBack, relPos);
+                    
+                    // In camera space, points in front have NEGATIVE Z (camera looks down -Z)
+                    // Visible if cz < 0 (in front) and within NDC bounds
+                    float aspect = 16.f / 9.f;
+                    float tanV = tanH / aspect;
+                    float ndcX = cx / (-cz * tanH);
+                    float ndcY = cy / (-cz * tanV);
+                    
+                    bool visible = (cz < 0) && (ndcX >= -1.0f && ndcX <= 1.0f) && (ndcY >= -1.0f && ndcY <= 1.0f);
+                    if (visible) visibleCount++;
+                    
+                    std::printf("  Prop %d: ndc=(%.3f, %.3f) cz=%.3f %s\n", i, ndcX, ndcY, cz, visible ? "VISIBLE" : "culled");
+                }
+                std::printf("  -> %d/4 props visible\n", visibleCount);
+            }
+        }
+        std::printf("=== END PROJECTION TEST ===\n\n");
+    }
+    
+    // Spin test: print prop angle over 5 frames at 3 throttle levels
+    if (debugMode) {
+        std::printf("=== PROP OVERLAY SPIN TEST ===\n");
+        float testRPMs[3][4] = {
+            {1000.f, 1000.f, 1000.f, 1000.f},   // Idle ~1000 RPM
+            {15000.f, 15000.f, 15000.f, 15000.f}, // 50% throttle ~15000 RPM
+            {28000.f, 28000.f, 28000.f, 28000.f}  // 100% throttle ~28000 RPM
+        };
+        const char* throttleNames[3] = {"Idle (1000 RPM)", "50% (15000 RPM)", "100% (28000 RPM)"};
+        for (int t = 0; t < 3; ++t) {
+            std::printf("\n%s:\n", throttleNames[t]);
+            for (int frame = 0; frame < 5; ++frame) {
+                float time = frame * (1.f / 60.f); // 60 FPS
+                std::printf("  Frame %d (t=%.3fs): ", frame, time);
+                for (int i = 0; i < 4; ++i) {
+                    float rpm = testRPMs[t][i];
+                    float dir = (i == 0 || i == 3) ? 1.0f : -1.0f;
+                    float angle = rpm * (2.f * PI / 60.f) * time * dir;
+                    float angleDeg = angle * 180.f / PI;
+                    // Normalize to 0-360
+                    while (angleDeg < 0) angleDeg += 360.f;
+                    while (angleDeg >= 360.f) angleDeg -= 360.f;
+                    std::printf("Prop%d=%.1f° ", i, angleDeg);
+                }
+                std::printf("\n");
+            }
+        }
+        std::printf("=== END SPIN TEST ===\n\n");
+    }
+    
+    // Blur test: print disc alpha at idle/50%/100% throttle
+    if (debugMode) {
+        std::printf("=== PROP OVERLAY BLUR TEST ===\n");
+        float testRPMsBlur[3] = {1000.f, 15000.f, 28000.f};
+        const char* throttleNamesBlur[3] = {"Idle (1000 RPM)", "50% (15000 RPM)", "100% (28000 RPM)"};
+        float maxRPM = 30000.f;
+        for (int t = 0; t < 3; ++t) {
+            float rpm = testRPMsBlur[t];
+            float rpmNorm = std::min(1.f, rpm / maxRPM);
+            // smoothstep(0.3, 0.8, rpmNorm)
+            float bladeAlpha, discAlpha;
+            if (rpmNorm <= 0.3f) {
+                bladeAlpha = 1.0f;
+                discAlpha = 0.0f;
+            } else if (rpmNorm >= 0.8f) {
+                bladeAlpha = 0.0f;
+                discAlpha = 1.0f;
+            } else {
+                float t_smooth = (rpmNorm - 0.3f) / (0.8f - 0.3f);
+                float smooth = t_smooth * t_smooth * (3.f - 2.f * t_smooth); // smoothstep
+                bladeAlpha = 1.0f - smooth;
+                discAlpha = smooth;
+            }
+            // Propeller alpha = bladeAlpha * wobble + discAlpha * 0.3 * wobble (wobble ~1.0 at these RPMs)
+            float propAlpha = bladeAlpha + discAlpha * 0.3f;
+            float finalAlpha = propAlpha * 0.85f; // 85% opacity default
+            std::printf("%s: rpmNorm=%.3f, bladeAlpha=%.3f, discAlpha=%.3f, propAlpha=%.3f, finalAlpha=%.3f\n",
+                        throttleNamesBlur[t], rpmNorm, bladeAlpha, discAlpha, propAlpha, finalAlpha);
+        }
+        std::printf("=== END BLUR TEST ===\n\n");
+    }
+    
+    // Depth test: verify props render on top of wall 5cm in front of camera
+    if (debugMode) {
+        std::printf("=== PROP OVERLAY DEPTH TEST ===\n");
+        // Reuse camera position from projection test (already computed)
+        // Camera position in drone-local frame
+        float armLenDepth = sim.P.armLength;
+        float bodyHeightDepth = 0.025f;
+        float bodyDepthDepth = armLenDepth * 0.25f;
+        float cameraSizeDepth = armLenDepth * 0.15f;
+        V3 camLocalPosDepth = {0, bodyHeightDepth * 0.5f + cameraSizeDepth * 0.5f, -bodyDepthDepth - cameraSizeDepth * 0.5f};
+        std::printf("Camera local pos: (%.3f, %.3f, %.3f)\n", camLocalPosDepth.x, camLocalPosDepth.y, camLocalPosDepth.z);
+        
+        // Prop positions (front props)
+        V3 prop0Depth = { armLenDepth * 0.70710678f, 0.022f, -armLenDepth * 0.70710678f };
+        V3 prop1Depth = {-armLenDepth * 0.70710678f, 0.022f, -armLenDepth * 0.70710678f };
+        std::printf("Prop 0 (drone-local): (%.3f, %.3f, %.3f)\n", prop0Depth.x, prop0Depth.y, prop0Depth.z);
+        std::printf("Prop 1 (drone-local): (%.3f, %.3f, %.3f)\n", prop1Depth.x, prop1Depth.y, prop1Depth.z);
+        
+        // Wall 5cm in front of camera (in camera space, this is at Z = -0.05)
+        float tiltRadDepth = rad(cfg.camTilt); // default 33°
+        float cosTDepth = cosf(tiltRadDepth);
+        float sinTDepth = sinf(tiltRadDepth);
+        V3 overlayBackDepth = {0, -sinTDepth, cosTDepth}; // Camera -Z axis in drone-local
+        
+        // Wall is 5cm along camera -Z from camera position
+        V3 wallPosDepth = camLocalPosDepth + overlayBackDepth * (-0.05f); // 5cm in front
+        std::printf("Wall pos (drone-local, 5cm in front of cam): (%.3f, %.3f, %.3f)\n", wallPosDepth.x, wallPosDepth.y, wallPosDepth.z);
+        
+        // Compute depth (distance along camera -Z) for props and wall
+        // In camera space, depth = -dot(overlayBack, point - camLocalPos)
+        auto computeDepth = [&](const V3& p, const V3& camPos, const V3& camBack) -> float {
+        V3 rel = {p.x - camPos.x, p.y - camPos.y, p.z - camPos.z};
+        return -dot(camBack, rel); // positive = in front of camera
+    };
+    
+    float prop0DepthVal = computeDepth(prop0Depth, camLocalPosDepth, overlayBackDepth);
+    float prop1DepthVal = computeDepth(prop1Depth, camLocalPosDepth, overlayBackDepth);
+    float wallDepthVal = computeDepth(wallPosDepth, camLocalPosDepth, overlayBackDepth);
+    std::printf("Prop 0 depth (camera -Z): %.4f m\n", prop0DepthVal);
+    std::printf("Prop 1 depth (camera -Z): %.4f m\n", prop1DepthVal);
+    std::printf("Wall depth (camera -Z):   %.4f m\n", wallDepthVal);
+    
+    // Props should be closer (smaller depth) than wall
+    bool prop0InFront = prop0DepthVal < wallDepthVal;
+    bool prop1InFront = prop1DepthVal < wallDepthVal;
+    std::printf("Prop 0 in front of wall: %s (%.4f < %.4f)\n", prop0InFront ? "YES" : "NO", prop0DepthVal, wallDepthVal);
+    std::printf("Prop 1 in front of wall: %s (%.4f < %.4f)\n", prop1InFront ? "YES" : "NO", prop1DepthVal, wallDepthVal);
+    std::printf("=== END DEPTH TEST ===\n\n");
+    }
+    
     GLuint vaoTraffic, vboTraffic;
     gl.glGenVertexArrays(1, &vaoTraffic);
     gl.glBindVertexArray(vaoTraffic);
@@ -2131,6 +3825,45 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
     Quat dbgFreezeCamQuat{};
     std::vector<uint8_t> dbgPrevFramePixels;
 
+    // Dynamic FPS (like Minecraft Dynamic FPS mod)
+    // Lowers FPS to 5 when window unfocused or after 60s inactivity
+    Uint64 lastInputTime = SDL_GetPerformanceCounter();
+    bool windowFocused = true;
+    const double DYNAMIC_FPS_THRESHOLD = 60.0;  // seconds of inactivity
+    const int IDLE_FPS = 5;  // FPS when idle
+    const double IDLE_FRAME_TIME = 1.0 / IDLE_FPS;  // 0.2s = 200ms per frame
+    bool isThrottled = false;
+    double currentFPS = 60.0;
+
+    // Debug overlay analysis (runs once before main loop)
+    if (debugOverlay) {
+        // Get window size for framebuffer
+        int dw, dh;
+        SDL_GL_GetDrawableSize(win, &dw, &dh);
+        
+        debugRenderPropOverlay(
+            sim, cfg,
+            vaoPropOverlay, propOverlayMeshVerts,
+            dw, dh,
+            debugFbo, debugTex, debugDepth
+        );
+    }
+
+    // Debug props lowering verification (runs once before main loop)
+    if (debugPropsLowering) {
+        int dw, dh;
+        SDL_GL_GetDrawableSize(win, &dw, &dh);
+        
+        verifyPropsLowering(
+            sim,
+            vaoPropOverlay, propOverlayMeshVerts,
+            dw, dh,
+            debugFbo, debugTex, debugDepth
+        );
+        // Exit after verification
+        running = false;
+    }
+
     while (running) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
@@ -2143,6 +3876,19 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
                         radio = Radio{};
                         std::printf("radio disconnected\n");
                     }
+                    break;
+                case SDL_WINDOWEVENT:
+                    if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
+                        windowFocused = true;
+                        lastInputTime = SDL_GetPerformanceCounter();  // Reset timer on focus
+                    } else if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+                        windowFocused = false;
+                    }
+                    break;
+                case SDL_MOUSEMOTION:
+                case SDL_MOUSEBUTTONUP:
+                case SDL_MOUSEWHEEL:
+                    lastInputTime = SDL_GetPerformanceCounter();
                     break;
                 case SDL_KEYDOWN: {
                     SDL_Scancode sc = e.key.keysym.scancode;
@@ -2326,6 +4072,9 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
                     }
                     break;
                 case SDL_MOUSEBUTTONDOWN:
+                    // Update lastInputTime for Dynamic FPS
+                    lastInputTime = SDL_GetPerformanceCounter();
+                    
                     if (settingsOpen && e.button.button == SDL_BUTTON_LEFT) {
                         int ww, wh, dw, dh;
                         SDL_GetWindowSize(win, &ww, &wh); SDL_GL_GetDrawableSize(win, &dw, &dh);
@@ -2401,6 +4150,9 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
         const bool useRadio = radio.joy && !forceKeyboard;
         float mapped[6] = {0, 0, 0, 0, 0, 0};  // roll, pitch, throttle(-1..1), yaw, arm, reset
         const Uint8* keys = SDL_GetKeyboardState(nullptr);
+        
+        // Check for any input activity to update lastInputTime (for Dynamic FPS)
+        bool hasInput = false;
         if (useRadio) {
             SDL_JoystickUpdate();
             mapped[0] = readAxis(radio, cfg.axRoll, cfg.invRoll);
@@ -2409,6 +4161,12 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
             mapped[3] = readAxis(radio, cfg.axYaw, cfg.invYaw);
             mapped[4] = readAxis(radio, cfg.axArm, cfg.invArm);
             mapped[5] = readAxis(radio, cfg.axReset, cfg.invReset);
+            // Check if any joystick axis is significantly moved
+            if (fabsf(mapped[0]) > 0.1f || fabsf(mapped[1]) > 0.1f || 
+                fabsf(mapped[2]) > 0.1f || fabsf(mapped[3]) > 0.1f ||
+                fabsf(mapped[4]) > 0.1f || fabsf(mapped[5]) > 0.1f) {
+                hasInput = true;
+            }
             in.roll = applyDeadband(mapped[0], cfg.deadband);
             in.pitch = applyDeadband(mapped[1], cfg.deadband);
             in.yaw = applyDeadband(mapped[3], cfg.deadband);
@@ -2429,6 +4187,17 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
             in.arm = kbArm;
             mapped[0] = in.roll; mapped[1] = in.pitch; mapped[2] = in.throttle * 2.f - 1.f; mapped[3] = in.yaw;
             mapped[4] = kbArm ? 1.f : -1.f;
+            // Check for keyboard input activity
+            if (keys[SDL_SCANCODE_W] || keys[SDL_SCANCODE_S] || keys[SDL_SCANCODE_UP] || 
+                keys[SDL_SCANCODE_DOWN] || keys[SDL_SCANCODE_LEFT] || keys[SDL_SCANCODE_RIGHT] ||
+                keys[SDL_SCANCODE_A] || keys[SDL_SCANCODE_D]) {
+                hasInput = true;
+            }
+        }
+
+        // Update lastInputTime if any input detected
+        if (hasInput) {
+            lastInputTime = SDL_GetPerformanceCounter();
         }
 
         // ---- physics (fixed step)
@@ -2554,10 +4323,13 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
             }
         }
 
+        // if (frameCounter == 1) print_draw_order();
+        if (debugGlState && frameCounter == 1) dump_gl_state("START_FRAME");
+
         // ---- draw camera view
         gl.glBindFramebuffer(GL_FRAMEBUFFER, sceneFbo);
         glViewport(0, 0, dw, dh);
-        glClear(GL_DEPTH_BUFFER_BIT);
+        glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_BLEND);
         gl.glUseProgram(progSky);
@@ -2600,6 +4372,173 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
             gl.glBufferData(GL_ARRAY_BUFFER, trafficMesh.size() * sizeof(float), trafficMesh.data(), GL_DYNAMIC_DRAW);
             gl.glBindVertexArray(vaoTraffic);
             glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(trafficMesh.size() / 10));
+        }
+
+        // ---- Drone planar projected shadow
+        if (cfg.droneShadow) {
+            // Raycast down from drone to find surface
+            float hitY;
+            V3 hitNormal;
+            const float maxShadowDist = 60.0f;
+            if (raycastDown(d.pos, sim.world, sim.thinCylinders, maxShadowDist, hitY, hitNormal)) {
+                // Build drone model matrix
+                float model[16];
+                // Model matrix: translate to drone pos, rotate by drone orientation
+                V3 xAxis = rotate(d.q, {1, 0, 0});
+                V3 yAxis = rotate(d.q, {0, 1, 0});
+                V3 zAxis = rotate(d.q, {0, 0, 1});
+                model[0] = xAxis.x; model[4] = xAxis.y; model[8] = xAxis.z; model[12] = d.pos.x;
+                model[1] = yAxis.x; model[5] = yAxis.y; model[9] = yAxis.z; model[13] = d.pos.y;
+                model[2] = zAxis.x; model[6] = zAxis.y; model[10] = zAxis.z; model[14] = d.pos.z;
+                model[3] = 0; model[7] = 0; model[11] = 0; model[15] = 1;
+                
+                // Sun direction (matches sky/light)
+                V3 sunDir = normalize3({0.45f, 0.85f, 0.30f});
+                
+                // Render shadow with stencil buffer to avoid double-darkening
+                glEnable(GL_STENCIL_TEST);
+                glStencilFunc(GL_ALWAYS, 1, 0xFF);
+                glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+                glStencilMask(0xFF);
+                glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+                glDepthMask(GL_FALSE);
+                
+                // First pass: write stencil
+                gl.glUseProgram(progDroneShadow);
+                gl.glUniformMatrix4fv(uDroneShadowVP, 1, GL_FALSE, VP);
+                gl.glUniformMatrix4fv(uDroneShadowModel, 1, GL_FALSE, model);
+                gl.glUniform3f(uDroneShadowSunDir, sunDir.x, sunDir.y, sunDir.z);
+                // Add 1.5cm offset to avoid z-fighting
+                gl.glUniform1f(uDroneShadowHeight, hitY + 0.015f);
+                gl.glUniform3f(uDroneShadowPlaneNormal, hitNormal.x, hitNormal.y, hitNormal.z);
+                gl.glBindVertexArray(vaoDrone);
+                glDrawArrays(GL_TRIANGLES, 0, droneMeshVerts);
+                
+                // Second pass: render shadow where stencil == 1
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                glStencilFunc(GL_EQUAL, 1, 0xFF);
+                glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glDepthFunc(GL_LEQUAL);
+                glDepthMask(GL_FALSE);
+                
+                glDrawArrays(GL_TRIANGLES, 0, droneMeshVerts);
+                
+                // Restore state
+                glDepthFunc(GL_LESS);
+                glDepthMask(GL_TRUE);
+                glDisable(GL_STENCIL_TEST);
+                glDisable(GL_BLEND);
+            }
+        }
+        
+        if (debugGlState && frameCounter == 1) dump_gl_state("AFTER_WORLD_PASS");
+
+        // ---- Propeller overlay (FPV camera view)
+        if (cfg.propsInView) {
+            if (debugGlState && frameCounter == 1) dump_gl_state("BEFORE_PROP_OVERLAY");
+            // Clear depth only, keep color (world already rendered)
+            glClear(GL_DEPTH_BUFFER_BIT);
+
+            // Build view matrix for propeller overlay: camera tilt only, no translation
+            // Camera local position in drone frame - MATCH MAIN CAMERA: {0, 0.03f, -0.07f}
+            V3 camLocalPos = {0, 0.03f, -0.07f};
+
+            // Camera tilt quaternion (around X axis) - positive tilt means camera looks UP
+            float tiltRad = rad(cfg.camTilt);
+            
+            // Props lowering: additional rotation around lateral (X) axis to move props down in view
+            // angle = (percent / 100) * (vertical_half_FOV + 20 degrees)
+            float aspect = (float)dw / (float)dh;
+            float tanH = std::tan(rad(cfg.fovH) * 0.5f);
+            float tanV = tanH / aspect;
+            float verticalHalfFOV = std::atan(tanV);  // radians
+            float loweringAngleRad = (cfg.propsLowering / 100.0f) * (verticalHalfFOV + rad(20.0f));
+            
+            // Total tilt = camera tilt + props lowering (both rotate around X axis)
+            float totalTiltRad = tiltRad + loweringAngleRad;
+            float cosT = cosf(totalTiltRad);
+            float sinT = sinf(totalTiltRad);
+            V3 overlayRight = {1, 0, 0};
+            V3 overlayUp = {0, cosT, sinT};
+            V3 overlayBack = {0, -sinT, cosT};
+
+            // View matrix: R^T * T(-camLocalPos)
+            float view[16] = {
+                overlayRight.x, overlayUp.x, overlayBack.x, 0,
+                overlayRight.y, overlayUp.y, overlayBack.y, 0,
+                overlayRight.z, overlayUp.z, overlayBack.z, 0,
+                -dot(overlayRight, camLocalPos), -dot(overlayUp, camLocalPos), -dot(overlayBack, camLocalPos), 1
+            };
+
+            // Overlay projection: same FOV/aspect as main, but near=0.002, far=1.0
+            // aspect, tanH, tanV already computed above for lowering angle
+            float overlayNear = 0.002f;
+            float overlayFar = 1.0f;
+            float P_overlay[16] = {0};
+            P_overlay[0] = 1.f / tanH;
+            P_overlay[5] = 1.f / tanV;
+            P_overlay[10] = (overlayFar + overlayNear) / (overlayNear - overlayFar);
+            P_overlay[11] = -1.f;
+            P_overlay[14] = 2.f * overlayFar * overlayNear / (overlayNear - overlayFar);
+
+            // Sun direction
+            V3 sunDir = normalize3({0.45f, 0.85f, 0.30f});
+
+            // Current time for propeller animation
+            float currentTime = (float)SDL_GetTicks() * 0.001f;
+
+            // Render propeller overlay
+            gl.glUseProgram(progPropOverlay);
+            gl.glUniformMatrix4fv(uPropOverlayVP, 1, GL_FALSE, P_overlay);  // Use overlay projection
+            gl.glUniformMatrix4fv(uPropOverlayView, 1, GL_FALSE, view);
+            gl.glUniform1f(uPropOverlayTime, currentTime);
+
+            // Motor RPM from physics (sim.d.motorRPM)
+            for (int i = 0; i < 4; ++i) {
+                gl.glUniform1f(uPropOverlayRPM[i], sim.d.motorRPM[i]);
+            }
+
+            gl.glUniform1f(uPropOverlayOpacity, cfg.propsOpacity);
+            gl.glUniform1i(uPropOverlayBlades, 3);
+            gl.glUniform3f(uPropOverlaySunDir, sunDir.x, sunDir.y, sunDir.z);
+
+            // Enable blending for propeller transparency
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            // Disable culling so blades are visible from both sides
+            glDisable(GL_CULL_FACE);
+            glDepthFunc(GL_LEQUAL);
+            glDepthMask(GL_TRUE);
+
+            // Performance timing for propeller overlay
+            static uint64_t perfOverlayStart = 0;
+            static double perfOverlayAccum = 0.0;
+            static int perfOverlayFrames = 0;
+            perfOverlayStart = SDL_GetPerformanceCounter();
+
+            gl.glBindVertexArray(vaoPropOverlay);
+            glDrawArrays(GL_TRIANGLES, 0, propOverlayMeshVerts);
+
+            // End timing
+            uint64_t perfOverlayEnd = SDL_GetPerformanceCounter();
+            double perfOverlayMs = (double)(perfOverlayEnd - perfOverlayStart) * 1000.0 / SDL_GetPerformanceFrequency();
+            perfOverlayAccum += perfOverlayMs;
+            perfOverlayFrames++;
+            
+            // Print performance every 60 frames (~1 second at 60 FPS) - only in debug mode
+            if (debugMode && perfOverlayFrames % 60 == 0) {
+                double avgMs = perfOverlayAccum / perfOverlayFrames;
+                std::printf("[PERF] Prop overlay avg: %.3f ms over %d frames (target < 0.3ms)\n", avgMs, perfOverlayFrames);
+            }
+
+            // Restore state
+            glEnable(GL_CULL_FACE);
+            glDepthFunc(GL_LESS);
+            glDisable(GL_BLEND);
+            
+            if (debugGlState && frameCounter == 1) dump_gl_state("AFTER_PROP_OVERLAY");
         }
 
         // ---- Analog video signal update
@@ -2673,6 +4612,8 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
             glDrawArrays(GL_TRIANGLES, 0, 3);
         }
 
+        if (debugGlState && frameCounter == 1) dump_gl_state("BEFORE_OSD");
+
         // ---- OSD
         osd.v.clear();
         const float S = std::max(2.f, std::floor(dh / 240.f));
@@ -2736,7 +4677,7 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
         else if (d.armBlocked) osd.textCenter(dw * 0.5f, dh - M - 7.f * S, S, "ARM BLOCKED - LOWER THROTTLE", 1.f, 0.3f, 0.3f);
         else osd.textCenter(dw * 0.5f, dh - M - 7.f * S, S, "DISARMED", 1, 1, 1);
 
-        std::snprintf(buf, sizeof buf, "%d FPS", (int)(fpsAvg + 0.5));
+        std::snprintf(buf, sizeof buf, "%d FPS", (int)(isThrottled ? currentFPS : fpsAvg + 0.5));
         if (monitor) {
             const float inputBox = clampf(dh * 0.23f, 112.f, 184.f);
             osd.textCenter(dw - M - inputBox * 0.5f, dh - M - inputBox - 9.f * S, S,
@@ -2881,6 +4822,7 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
         }
 
         glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         gl.glUseProgram(progOsd);
@@ -2888,9 +4830,45 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
         gl.glBindVertexArray(vaoOsd);
         gl.glBindBuffer(GL_ARRAY_BUFFER, vboOsd);
         gl.glBufferData(GL_ARRAY_BUFFER, osd.v.size() * sizeof(float), osd.v.data(), GL_STREAM_DRAW);
+        
         glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(osd.v.size() / 6));
 
+        // UI Visibility Test: run on first frame when debug GL state is enabled
+        if (debugGlState && (frameCounter == 1 || frameCounter == 2)) {
+            testUIVisibility(dw, dh, "FRAME", cfg.propsInView, osd.v.size() / 6, frameCounter);
+        }
+
         SDL_GL_SwapWindow(win);
+        
+        // Dynamic FPS: throttle to 5 FPS when window unfocused or after 60s inactivity
+        Uint64 frameEnd = SDL_GetPerformanceCounter();
+        double elapsedFrameTime = (double)(frameEnd - now) / freq;
+        isThrottled = false;
+        if (!windowFocused) {
+            // Window unfocused: throttle to IDLE_FPS
+            double targetFrameTime = IDLE_FRAME_TIME;
+            if (elapsedFrameTime < targetFrameTime) {
+                double delayMs = (targetFrameTime - elapsedFrameTime) * 1000.0;
+                SDL_Delay((Uint32)delayMs);
+                isThrottled = true;
+            }
+            currentFPS = IDLE_FPS;
+        } else {
+            // Window focused: check for inactivity
+            double inactiveTime = (double)(frameEnd - lastInputTime) / freq;
+            if (inactiveTime > DYNAMIC_FPS_THRESHOLD) {
+                // Inactive for 60+ seconds: throttle to IDLE_FPS
+                double targetFrameTime = IDLE_FRAME_TIME;
+                if (elapsedFrameTime < targetFrameTime) {
+                    double delayMs = (targetFrameTime - elapsedFrameTime) * 1000.0;
+                    SDL_Delay((Uint32)delayMs);
+                    isThrottled = true;
+                }
+                currentFPS = IDLE_FPS;
+            } else {
+                currentFPS = 1.0 / elapsedFrameTime;
+            }
+        }
         
         // ---- Debug tests for flickering investigation
         if (freezeTest && dbgFreezeFrame == -1) {
@@ -3005,6 +4983,10 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
     saveConfig(cfg, cfgPath);
     if (audioDevice) SDL_CloseAudioDevice(audioDevice);
     if (radio.joy) SDL_JoystickClose(radio.joy);
+    // Cleanup debug framebuffer
+    if (debugFbo) gl.glDeleteFramebuffers(1, &debugFbo);
+    if (debugTex) gl.glDeleteTextures(1, &debugTex);
+    if (debugDepth) gl.glDeleteRenderbuffers(1, &debugDepth);
     SDL_GL_DeleteContext(ctx);
     SDL_DestroyWindow(win);
     SDL_Quit();

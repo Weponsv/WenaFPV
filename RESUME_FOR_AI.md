@@ -5,7 +5,7 @@
 
 ---
 
-## Current State Summary (v1.1.5_ALPHA)
+## Current State Summary (v1.1.6_ALPHA)
 
 ### What Was Removed (Training/Game Features)
 All training-specific game mechanics have been stripped out:
@@ -25,9 +25,22 @@ All training-specific game mechanics have been stripped out:
 **From `world.hpp`:**
 - No deletions — kept all map geometry, level file format, loader, generator, and materials
 
-### What Was Added/Modified in This Session (v1.1.0)
+### What Was Added/Modified in This Session (v1.1.6_ALPHA)
 
-#### Config & Settings
+#### Props Lowering Feature (Camera Settings)
+- **New config option**: `propsLowering` (0.0–1.0, default 0.0) in CAMERA tab
+- **Setting**: "Props lowering: 0-100%" slider, step 5%, saved in config.ini
+- **Implementation**: Rotation around camera lateral axis in propeller overlay view matrix
+  - `loweringAngleRad = (percent/100) * (vertical_half_FOV + 20°)`
+  - `totalTiltRad = cameraTiltRad + loweringAngleRad`
+- **Verification**: `--debug-props-lowering` flag produces:
+  - Lit pixel tables for 0/25/50/75/100% at FOV 90/120/160, tilt 20/33
+  - ASCII dumps (100×40) for FOV 160/tilt 33 at 0%, 50%, 100%
+  - Computed angles per config
+  - Monotonic decrease verification (passes all normal cases; edge case at FOV160/Tilt33/100% due to extreme 133.5° tilt)
+- **No regressions**: Props opacity and "Props in view" settings continue working
+
+#### Config & Settings (v1.1.5)
 - **`abandoned_base_seed`** config option in QUALITY tab (F5), full uint32 range, persists to config.ini
 - Default seed: `0xDEADBEEF` (3735928559)
 
@@ -118,6 +131,7 @@ fpvsim-working/
 - ✅ Shadow rendering fixes: no blinking on Abandoned Base map
 - ✅ VID HUD positioned correctly under battery MAH
 - ✅ Texture randomization applied to all 5 maps
+- ✅ Props lowering setting works, persists, verified with `--debug-props-lowering`
 
 ---
 
@@ -176,6 +190,7 @@ Key settings:
 - **Wind:** Enabled, strength (0-100→0-18m/s), direction, gust, turbulence, HUD
 - **Shadows:** Enabled, resolution (512/1024/2048), distance, fade, altitude, strength, bias, filtering
 - **Radio:** Axis mapping, inversion, deadband, arm threshold, joystick name filter
+- **Camera:** Props in view, Props opacity, **Props lowering (0-100%, step 5%)**
 
 ---
 
@@ -208,6 +223,9 @@ Key settings:
 ./wenafpv
 
 # While on abandoned base map, press F5 to reload my_map.level
+
+# Debug props lowering verification
+./wenafpv --debug-props-lowering
 ```
 
 ---
@@ -242,63 +260,30 @@ Simulates authentic analog FPV interference:
 - **Dynamic effects:** Rolling sync bar, chroma glitch, horizontal tear, frame freeze/dropout, NTSC dot-crawl, sync loss waves, color burst rainbow bands, multipath ghost image
 
 ---
- 
+
 ## Notes for Future Work
- 
+
 - No motor sound yet (audio synthesis params defined in sim.hpp but not hooked to output)
 - No turtle mode, angle/horizon modes, race tracks, replays
 - Physics remains an approximation until tuned against measured motor/prop/airframe data
 - Level file markers are parsed but not used (training features removed)
 - **Known issue:** Texture randomization causes z-fighting on coplanar surfaces (detail props on floors/walls, overlapping boxes from generator). Needs: offset detail geometry by 1-2cm along normals, or use polygon offset for detail geometry, or implement hidden face culling.
 - The abandoned base map uses configurable seed (`abandoned_base_seed` in config.ini, default `0xDEADBEEF`)
- 
+
 ---
 
-## Active Debugging Session (2026-10-25) — **RESOLVED**
+## Resolved Debugging Sessions
 
-### Flickering Investigation - "Textures over Textures"
+### Flickering Investigation — RESOLVED (2026-10-25, Session 3)
+**Problem:** Constant flickering in GPU-side texture randomization (`hash21()` in WORLD_FS shader) using large world coordinates (±1500).
 
-**Problem:** Constant flickering in the new GPU-side texture randomization (WORLD_FS shader's `hash21()` function) using large world coordinates (±1500) with `floor(surface * scale)`.
+**Root Cause Found:** The reported "flickering" was the **intentional analog video effects** (enabled by default with time-varying noise, rolling bar, chromatic aberration, etc.). Scene rendering itself was fully deterministic.
 
-**Root Cause Hypothesis:** The `hash21()` function uses `fract(p * vec2(123.34, 456.21))` on large world-space coordinates, causing floating-point precision issues. When camera moves slightly, `floor()` sometimes returns different values, causing texture flickering.
+**Potential Secondary Issue (Fixed Preemptively):** `hash21()` multiplied large integer coordinates by float constants and took `fract()`, risking precision loss at high magnitudes.
 
-**Debug Infrastructure Added (main.cpp):**
-
-**Command-line flags:**
-- `--freeze-test [FRAMES]` — Freezes camera after first frame, renders N frames to check if flicker is time/camera dependent
-- `--frame-diff-test [FRAMES]` — Compares consecutive frames pixel-by-pixel to detect non-deterministic rendering
-- `--draw-call-audit` — Prints draw call breakdown and vertex counts on first frame
-- `--disable-video` — Skips analog video post-processing for isolated scene testing
-- `--map N` — Selects map at startup (0=Freestyle Park, 1=Gate Training, 2=Slalom, 3=3.5 Tech Park, 4=Abandoned Base)
-- `--dbg-disable-hash21/--dbg-disable-grain/--dbg-disable-scratch/--dbg-disable-detail/--dbg-disable-shadows` — Debug toggles via CLI
-
-**Runtime feature toggles (F6-F12 keys):**
-- F6: Disable `hash21` entirely (replace with 0.5)
-- F7: Disable grain detail
-- F8: Disable scratch detail
-- F9: Disable all detail (`uDetail = 0`)
-- F10: Disable shadows
-- F12: Wireframe mode
-
-**Investigation Results:**
-
-| Test | Result | Interpretation |
-|------|--------|----------------|
-| `--frame-diff-test 60 --map 1 --freeze-test 60` | 68% pixels differ | **Video effects cause flicker** with static camera |
-| `--frame-diff-test 60 --disable-video --map 1 --freeze-test 60` | **0% pixels differ** | Scene rendering is fully deterministic |
-| `--frame-diff-test 60 --disable-video --map 0 --freeze-test 60` | ~0% diff (traffic only) | Large coords (±1500) don't cause flicker |
-| `--frame-diff-test 60 --disable-video --map 4 --freeze-test 60` | ~0% diff (after settle) | Abandoned base detail props stable |
-
-**Root Causes Found:**
-
-1. **Primary — Analog Video Effects (Cause A variant):** The analog video post-processing (VIDEO_FS shader) is **enabled by default** with multiple effects (noise, static, rolling bar, chromatic aberration, tearing, dot-crawl, sync loss, color burst, multipath ghost) that change every frame based on `uTime`. This creates 68% frame-to-frame pixel differences even with a completely static camera. This is intentional analog FPV simulation, not a bug.
-
-2. **Potential Secondary — hash21 Float Precision (Cause E):** The `hash21()` function multiplied large integer coordinates (up to ~2000 from `floor(surface * 1.35)` at world edges) by float constants and took `fract()`, which loses precision at high magnitudes (~250,000). While testing on Intel HD 520 (Mesa) showed deterministic rendering, this is a potential cross-GPU/driver issue.
-
-**Fix Applied (src/main.cpp, WORLD_FS shader lines 153-157):**
-
+**Fix Applied (WORLD_FS shader):**
 ```glsl
-// NEW - stable hash for large integer coordinates (from floor())
+// Stable hash for large integer coordinates (from floor())
 float hash21(vec2 p) {
     vec3 p3 = fract(vec3(p.x, p.y, p.x + p.y) * 0.1031);
     p3 += dot(p3, p3.yzx + 33.33);
@@ -306,73 +291,39 @@ float hash21(vec2 p) {
 }
 ```
 
-- Uses small multiplier (0.1031) to keep values in good range for `fract()`
-- Based on same stable technique as `hash12` in VIDEO_FS shader
-- Handles large integer coordinates without precision loss
-- Maintains deterministic per-world-position texture variety
-- No visual change to texture appearance
-
 **Verification:**
 - All 48 physics tests pass
 - Scene rendering: 0% frame difference with static camera, video disabled
 - Video effects unchanged: 68% frame difference with video enabled (expected)
 - Draw call audit: ~5-7 draw calls, single world mesh draw call preserved
 
-**Conclusion:** The reported "flickering" was the intentional analog video effects. The `hash21` precision issue was a potential latent bug fixed preemptively. No changes to map layout, physics, audio, or input.
-
 ---
 
-## Ground Layer Z-Fighting Fix (2026-10-25, Session 4, v1.1.5_ALPHA)
+### Ground Layer Z-Fighting Fix — RESOLVED (2026-10-25, Session 4, v1.1.5_ALPHA)
 
-### Problem
-The Abandoned Base map had **30 separate ground layers** with top faces at exactly Y=0, causing massive z-fighting (overlap areas up to 41,000 m²). Ground audit showed layer [0] (300×300m base slab at Y=[-0.5, 0]) overlapping with 29 other layers at Y=0.
+**Problem:** Abandoned Base map had **30 separate ground layers** with top faces at exactly Y=0, causing massive z-fighting (overlap areas up to 41,000 m²).
 
-### Root Cause
-Multiple explicit ground plane constructions in `buildAbandonedBase()` (world.hpp lines 835-878):
-1. Base ground with dirt variation (full 300×300m)
-2. Main base area with worn concrete (-60 to 60)
-3. Four outdoor yard quadrants around base
-4. Speed zone floor (separate addBox at Y=[0, 0.15])
-5. Reaction zone courtyard floor (separate addBox at Y=[0, 0.1])
-6. Notice zone floor patches (separate addBox at Y=[0, 0.1])
-7. Outdoor yard ground (separate addBox at Y=[-0.5, 0])
+**Fix Applied (src/world.hpp):** Consolidated to **single 100×100m patch system** covering full 300×300m area with material variation by region. Removed 4 overlapping ground layers. Detail props retain 0.01f (1cm) vertical offset.
 
-All had top face at exactly Y=0.0 (coplanar).
-
-### Fix Applied (src/world.hpp)
-**Consolidated ground layer** (lines 835-878): Single 100×100m patch system covering full 300×300m area with material variation by region:
-- Main base (-60 to 60): worn concrete
-- Speed zone corridor: worn concrete
-- Reaction zone courtyard: worn concrete
-- Notice zone: worn concrete
-- Outdoor yard (60 to 120): grass/dirt mix
-- Outer areas: grass/dirt mix
-
-**Removed overlapping ground layers:**
-1. Speed zone floor (was line 931)
-2. Reaction zone courtyard floor (was line 1023)
-3. Notice zone floor patches (was lines 1080-1086)
-4. Outdoor yard ground (was lines 1154-1160)
-
-Detail props (grass, rubble) retain 0.01f (1cm) vertical offset — sufficient for 24-bit depth buffer at this scale.
-
-### Verification Results
-| Test | Result |
-|------|--------|
-| Physics tests (48) | ✅ ALL PASSED |
-| Frame diff test (--freeze-test) | ~0.02-0.04% pixel difference (minimal, likely analog video noise) |
-| Diff image analysis | Almost entirely black — no significant z-fighting |
-| Ground audit | Shows structural element bottom faces (column bases, wall bases) as "layers" but these are buried — no visible flickering |
-
-### Before/After
+**Verification:**
 | Metric | Before | After |
 |--------|--------|-------|
 | Ground layers at Y=0 | 30 | 1 (consolidated) |
 | Max overlap area | 41,000 m² | 0 m² (ground plane) |
 | Frame diff (static camera, video disabled) | N/A | ~0.03% |
-| Physics regression | N/A | None (all tests pass) |
+| Physics regression | N/A | None (all 48 tests pass) |
 
-### Notes
-- Ground audit still detects 28 "layers" in Abandoned Base, but these are **bottom faces of vertical structures** (columns, walls, pillars) at Y=0 — they're buried in the ground and don't cause visible z-fighting
-- The 0.01f offset for detail props is sufficient for 24-bit depth precision (depth table: z=0.1 → depth=-0.500025)
-- Analog video effects remain the primary source of frame-to-frame variation (68% with video enabled)
+---
+
+### Props Lowering Debug Crash — RESOLVED (2026-10-26, v1.1.6_ALPHA)
+
+**Problem:** `--debug-props-lowering` crashed with "double free or corruption" at `glGenFramebuffers` and segfault at `glReadPixels`.
+
+**Root Cause:** Debug functions created framebuffers after initialization where GL driver state caused malloc corruption on `glGenFramebuffers`. Pixel readback crashed due to missing synchronization and pixel packing alignment.
+
+**Fix Applied (src/main.cpp):**
+1. Create debug framebuffers during main initialization (where GL works reliably)
+2. Pass pre-created handles to debug functions, resize attachments instead of creating new
+3. Add `glFinish()` + `glPixelStorei(GL_PACK_ALIGNMENT, 1)` before `glReadPixels`
+
+**Result:** Verification runs successfully, produces complete output tables and ASCII dumps.

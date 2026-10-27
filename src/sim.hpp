@@ -368,10 +368,24 @@ struct Sim {
                           -rad(rateCurve(P.roll, in.roll))};
         }
 
-        const float arm = std::max(0.01f, P.armLength) * 0.70710678f;
-        const float ix = std::max(1e-6f, P.mass * (P.armLength * P.armLength * 0.40f + P.radius * P.radius * 0.04f));
-        const float iy = std::max(1e-6f, P.mass * P.armLength * P.armLength * 0.65f);
-        const float iz = ix;
+        // Improved moment of inertia based on quadcopter mass distribution
+        // Assume ~35% of mass is at motor ends (motors, props, ESCs), rest is central body
+        float motorMassFraction = 0.35f;
+        float motorMass = P.mass * motorMassFraction * 0.25f;  // per motor
+        float bodyMass = P.mass * (1.f - motorMassFraction);
+        float arm = std::max(0.01f, P.armLength) * 0.70710678f;
+        float arm2 = arm * arm;
+        
+        // Roll and pitch: motors at arm_length contribute (2 motors on axis + 2 at 45° = 4 × 0.5)
+        float iMotor = 2.f * motorMass * arm2;  // per axis
+        // Body: approximate as box with dimensions ~armLength × armLength × radius
+        float iBody = bodyMass * (arm2 + P.radius * P.radius) / 6.f;
+        
+        const float ix = std::max(1e-6f, iMotor + iBody);  // roll
+        const float iy = std::max(1e-6f, iMotor + iBody);  // pitch (symmetric)
+        // Yaw: all 4 motors contribute fully at arm_length
+        float iMotorZ = 4.f * motorMass * arm2;
+        const float iz = std::max(1e-6f, iMotorZ + iBody * 2.f);  // yaw
         const float rpTau = std::max(0.006f, P.rateTau);
         const float yawTau = std::max(0.008f, P.yawTau);
         // Rate controller requests body torque; individual props must create it.
@@ -391,12 +405,15 @@ struct Sim {
             base + requestedTorque.x / (4.f * arm) - requestedTorque.z / (4.f * arm) - requestedTorque.y / (4.f * yawLever)};
 
         const float motorUpTau = std::max(0.002f, P.motorTau);
+        // Motor KV drops with voltage: scale max RPM by voltage factor (min 0.5)
+        float motorVoltageFactor = clampf(voltageFactor, 0.5f, 1.f);
+        float effectiveMaxRPM = P.maxMotorRPM * motorVoltageFactor;
         for (int i = 0; i < 4; ++i) {
             const float target = (power && !motorsOff) ? clampf(motorTarget[i], 0.f, maxMotorThrust) : 0.f;
             const float tau = target > d.motorThrust[i] ? motorUpTau : motorUpTau * 1.4f;
             d.motorThrust[i] += (target - d.motorThrust[i]) * (1.f - std::exp(-dt / tau));
-            // Convert thrust to RPM (thrust ∝ RPM²)
-            d.motorRPM[i] = P.maxMotorRPM * std::sqrt(clampf(d.motorThrust[i] / maxMotorThrust, 0.f, 1.f));
+            // Convert thrust to RPM (thrust ∝ RPM²), with KV voltage scaling
+            d.motorRPM[i] = effectiveMaxRPM * std::sqrt(clampf(d.motorThrust[i] / maxMotorThrust, 0.f, 1.f));
         }
         d.thrust = d.motorThrust[0] + d.motorThrust[1] + d.motorThrust[2] + d.motorThrust[3];
 
@@ -430,7 +447,20 @@ struct Sim {
         V3 up = rotate(d.q, {0, 1, 0});
         V3 airVelocity = d.vel - windVelocity();
         V3 vb = rotate(conj(d.q), airVelocity);  // air-relative velocity in body axes
+        
+        // Prop thrust unloading: linear model (original, carefully tuned for tests)
         float unload = clampf(1.f - std::max(0.f, vb.y) / P.propPitchSpeed, 0.15f, 1.f);
+        
+        // Ground effect: thrust boost when close to ground (within ~1 prop diameter)
+        // Based on momentum theory: induced velocity reduced near ground
+        float groundEffect = 1.f;
+        float heightAGL = d.pos.y - P.radius * 0.5f;  // approximate height above ground
+        if (heightAGL > 0.f && heightAGL < P.armLength * 2.f) {
+            float ratio = heightAGL / (P.armLength * 2.f);
+            // Smooth interpolation: 1.0 at 2*armLength, up to 1.15 at ground
+            groundEffect = 1.f + 0.15f * (1.f - ratio) * (1.f - ratio);
+        }
+        unload *= groundEffect;
         // Drag force always parallel to -vrel with ellipsoid-projected area:
         // vrel = vel - wind; v_hat = vrel / |vrel|; l = v_hat in body frame (direction cosines)
         // A(v_hat) = sqrt((Ax*lx)^2 + (Ay*ly)^2 + (Az*lz)^2);  // smooth area

@@ -67,9 +67,13 @@ struct Config {
     int shadowFilter = 1;        // 0 off, 1 2x2, 2 3x3 PCF
     bool shadowStableSnapping = true;
     bool shadowDebug = false;
+    bool droneShadow = true;  // planar projected drone shadow
 
     // camera (5" freestyle typical: 25-35 deg tilt, wide lens)
     float camTilt = 30.f;  // degrees up
+    bool propsInView = true;  // propeller overlay in FPV view
+    float propsOpacity = 85.f;  // propeller overlay opacity 0-100%
+    float propsLowering = 0.f;  // propeller lowering 0-100%
     float fovH = 110.f;    // horizontal degrees
 
     // radio mapping (SDL joystick axis indices; EdgeTX channel N -> axis N-1 for CH1..CH6)
@@ -151,9 +155,13 @@ inline std::vector<Entry> entries(Config& c) {
         {Entry::INT, "shadow_filter", &c.shadowFilter},
         {Entry::BOOL, "shadow_stable_snapping", &c.shadowStableSnapping},
         {Entry::BOOL, "shadow_debug", &c.shadowDebug},
+        {Entry::BOOL, "drone_shadow", &c.droneShadow},
         {Entry::FLOAT, "fog_density", &c.fogDensity},
         {Entry::FLOAT, "cam_tilt_deg", &c.camTilt},
         {Entry::FLOAT, "fov_horizontal_deg", &c.fovH},
+        {Entry::BOOL, "props_in_view", &c.propsInView},
+        {Entry::FLOAT, "props_opacity", &c.propsOpacity},
+        {Entry::FLOAT, "props_lowering", &c.propsLowering},
         {Entry::STR, "joystick_name_contains", &c.joystickName},
         {Entry::INT, "axis_roll", &c.axRoll},
         {Entry::INT, "axis_pitch", &c.axPitch},

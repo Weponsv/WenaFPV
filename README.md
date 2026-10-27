@@ -61,6 +61,37 @@ Distance loss, occlusion, multipath, low-battery interference, high-speed breaku
 
 ---
 
+## Rendering Pipeline (Draw Order)
+
+WenaFPV uses a forward rendering pipeline with a single world mesh draw call per frame. The draw order for each frame is:
+
+```
+=== DRAW ORDER (one frame) ===
+1. Shadow depth pass -> shadowFbo (shadowVP)
+2. Camera view -> sceneFbo:
+   2a. Sky pass (progSky, vaoSky, fullscreen triangle)
+   2b. World pass (progWorld, vaoWorld, VP matrix)
+   2c. Traffic cars (progWorld, vaoTraffic, VP matrix)
+   2d. Drone planar shadow (progDroneShadow, vaoDrone, VP matrix, stencil)
+   2e. Propeller overlay (progPropOverlay, vaoPropOverlay, P_overlay+view, blend, no cull)
+3. MSAA resolve (sceneFbo -> resolveFbo) if MSAA > 1
+4. Video post-process -> default framebuffer (progVideo, vaoSky, sceneColor texture)
+5. OSD/UI -> default framebuffer (progOsd, vaoOsd, orthographic uRes)
+   5a. Battery, altitude, speed, timer, ARMED status
+   5b. Settings menu (if open)
+6. Swap buffers
+=== END DRAW ORDER ===
+```
+
+**Key design choices:**
+- **Single world mesh** — All static geometry (maps, detail props) combined into one VAO/VBO for a single `glDrawArrays` call
+- **Shadow mapping** — Orthographic depth pass from light perspective, 1024px default, 120m range
+- **MSAA resolve** — Optional multisample resolve to single-sample texture for video post-processing
+- **Analog video post-process** — Full NTSC-style interference applied in fragment shader after scene render
+- **OSD overlay** — Rendered last in orthographic projection, unaffected by video effects
+
+---
+
 ## Building (Arch Linux)
 
 ```bash

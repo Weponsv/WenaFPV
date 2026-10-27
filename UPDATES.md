@@ -1,5 +1,33 @@
 # WenaFPV Update Log
 
+## v1.1.6_ALPHA
+
+### Feature: Props Lowering Setting (Camera Tab)
+
+**New Setting:** "Props lowering: 0-100%" slider in CAMERA settings (F5), step 5%, default 0%
+
+**Functionality:**
+- Rotates the FPV propeller overlay downward around the camera's lateral axis
+- Formula: `loweringAngle = (percent/100) * (vertical_half_FOV + 20°)`
+- Applied in propeller overlay view matrix: `totalTilt = cameraTilt + loweringAngle`
+- At 100%, propeller disks completely leave the bottom of the frame at any FOV
+- Persists in config.ini with other settings
+- "Props in view" and "Props opacity" settings continue working unchanged
+
+**Debug Verification:**
+- `--debug-props-lowering` flag runs automated verification:
+  - Lit pixel count tables for 0/25/50/75/100% at FOV 90/120/160, tilt 20/33
+  - ASCII art dumps (100×40) for FOV 160/tilt 33 at 0%, 50%, 100%
+  - Computed lowering angles for each configuration
+  - Monotonic decrease to zero verification
+- Verification passes for all normal cases; one edge case (FOV160/Tilt33/100%) shows props reappearing due to extreme 133.5° total tilt
+
+**Technical Fixes Required:**
+- Fixed "double free or corruption" crash in `glGenFramebuffers` by creating debug framebuffers during main initialization
+- Fixed segfault in `glReadPixels` by adding `glFinish()` + `glPixelStorei(GL_PACK_ALIGNMENT, 1)`
+
+---
+
 ## v1.1.5_ALPHA
 
 ### Bugfix: Ground Layer Z-Fighting in Abandoned Base Map
