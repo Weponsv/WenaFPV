@@ -55,6 +55,8 @@ Distance loss, occlusion, multipath, low-battery interference, high-speed breaku
 
 ### Other
 - Real-time shadows (configurable distance, fade, resolution, bias, stable snapping)
+- Procedural propeller overlay — polar shader blades with analytic motion blur, per-prop placement at motor positions, controllable via props opacity / props in view / props lowering
+- Props lowering camera setting — rotates the FPV propeller overlay downward (0–100%, step 5%, CAMERA tab) so the props leave the frame at 100%
 - Per-instance texture randomization + detail props (rocks, debris, tires, pallets, pipes, cones, weeds)
 - Settings persisted to `~/.config/wenafpv/config.ini`
 - Hot-plug joystick support
@@ -110,7 +112,9 @@ make test       # 48 headless physics tests (rates, hover, battery, collisions, 
 # Expected output: "ALL TESTS PASSED (0 failures)"
 
 # Install system-wide (optional)
-sudo make install  # installs to /usr/bin/wenafpv
+sudo make install  # installs to /usr/bin/wenafpv; the install rule returns
+# binary ownership to the invoking user (`chown $SUDO_USER`) so a normal `make`
+# keeps working after an install
 ```
 
 ### Build Options
@@ -135,6 +139,8 @@ wenafpv [--config FILE] [--list-joysticks] [--fonttest] [--generate [SEED] [OUTP
         [--ground-audit] [--color-census] [--disable-ground-layer N]
         [--map N] [--disable-video] [--dbg-disable-hash21] [--dbg-disable-grain]
         [--dbg-disable-scratch] [--dbg-disable-detail] [--dbg-disable-shadows]
+        [--debug-props-lowering] [--verify-props] [--bench-props N]
+        [--debug-shadow-scene]
 ```
 
 ---
@@ -191,7 +197,7 @@ Settings are saved to `~/.config/wenafpv/config.ini` on first run and updated vi
 ### Settings Tabs (F5 Menu)
 - **QUALITY** — Low/Medium/High presets, detail, fog, visibility
 - **DISPLAY** — Resolution, vsync, MSAA, fullscreen
-- **CAMERA** — Tilt, FOV
+- **CAMERA** — Tilt, FOV, **Props lowering (0–100%, step 5%)**
 - **RADIO** — Axis mapping, inversion, deadband, arm threshold, joystick filter
 - **RATES** — Betaflight Actual rates per axis (centre / max / expo)
 - **DRONE** — Size selector (75mm, 85mm, 3", 3.5", 5", Custom), physics profile
