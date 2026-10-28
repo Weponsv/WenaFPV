@@ -25,6 +25,11 @@ tests/physics_test: Makefile tests/physics_test.cpp src/sim.hpp src/config.hpp s
 install: wenafpv
 	install -Dm755 wenafpv $(DESTDIR)$(PREFIX)/bin/wenafpv
 	install -Dm644 README.md $(DESTDIR)$(PREFIX)/share/doc/wenafpv/README.md
+# After 'make clean && sudo make install' the binary above is (re)built as root.
+# Hand it back to the invoking user so the next normal 'make' can overwrite it.
+	@if [ -n "$$SUDO_USER" ] && [ "$$SUDO_USER" != "root" ]; then \
+		chown "$$SUDO_USER" wenafpv 2>/dev/null || true; \
+	fi
 
 clean:
 	rm -f wenafpv tests/physics_test

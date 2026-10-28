@@ -37,8 +37,35 @@ All training-specific game mechanics have been stripped out:
   - Lit pixel tables for 0/25/50/75/100% at FOV 90/120/160, tilt 20/33
   - ASCII dumps (100×40) for FOV 160/tilt 33 at 0%, 50%, 100%
   - Computed angles per config
-  - Monotonic decrease verification (passes all normal cases; edge case at FOV160/Tilt33/100% due to extreme 133.5° tilt)
+  - Props sweep through the lower corners as lowering increases and clear the corners at 100%
+    (corner counts are not monotonic by design)
 - **No regressions**: Props opacity and "Props in view" settings continue working
+
+#### Procedural Prop Overlay (v1.1.6)
+- One quad per front prop in the arm plane (two-sided, no culling, alpha blended), drawn by `PROP_OVERLAY_FS`
+- Polar shader blades: tapered blade with rounded tip, hub, `fwidth` AA, analytic angular motion blur
+  (1/240 s exposure, capped at blade pitch); blade count comes from the layout preset (3 blades)
+- Spin is analytic via `uSpinPhase[4]` — vertices no longer rotate around the drone origin
+- Props sit at the real motor positions (`±armCoord, y=0.022, z=−armCoord`); the old artificial
+  forward offset (`propZ = camZ − 0.03`) is removed. The world FPV camera uses the same mount,
+  so the view and the overlay agree.
+- Blade shading tuned for readability: mid-grey carbon body, bright edge sheen, light tip highlight
+  (~2× brighter than the first cut so blades read against both sky and ground); blade half-width
+  root/mid/tip = 0.22 / 0.50 / 0.110 of the tip radius
+- Shared `propOverlayLayout()` keeps all tunable geometry in one place (no new config settings):
+  - 3.5" mount 27.0 mm forward / 28.5 mm high, prop radius 30 mm
+  - 5" mount 40.0 mm forward / 29.0 mm high, prop radius 42 mm (`armLen × 0.40`)
+- `--verify-props` renders through the production shader and reports pixel-readback stats
+  plus 100×40 ASCII alpha/look dumps (static and 15000 RPM):
+  - 3.5" @ FOV160/tilt33/lowering25: prop centre NDC (+1.03, −0.87), coverage 4.25%,
+    87.2% of overlay pixels in the outer 25% bands
+  - 5" @ same: NDC (+0.99, −0.76), coverage 4.25%, 88.9% outer
+  - FOV120 and FOV90: 0% coverage (props fully out of frame); at 15000 RPM stays ≥80% outer
+- `--bench-props 300` (batched GL timer query, 1280×720): 0.15–0.17 ms/frame on Intel HD 520
+  (target <0.3 ms)
+- Debug flags `--debug-overlay` / `--debug-props-lowering` now render through the production shader
+  (flat per-prop colour path via `uDebugFlat`) using the same shared layout; the old
+  `DEBUG_PROP_OVERLAY_*` shader pair is deleted
 
 #### Config & Settings (v1.1.5)
 - **`abandoned_base_seed`** config option in QUALITY tab (F5), full uint32 range, persists to config.ini
@@ -96,6 +123,7 @@ All variations are deterministic per seed — same seed = identical map.
 - **Map selection** — F3/F4 cycles through all 5 maps
 - **Standard key bindings** — Printed at startup (F1-F5, F11, R, SPACE, arrows, WASD, etc.)
 - **Analog video effects** — Full NTSC-style interference simulation (noise, static, chromatic aberration, scanlines, rolling bar, tear, dropout, dot-crawl, sync loss, color burst loss, multipath ghost)
+- **Procedural prop overlay** — One shader-drawn quad per front prop (polar blades + analytic motion blur), placed at the screen edges by the preset camera mount; props opacity / props in view / props lowering still control it
 
 ---
 
@@ -111,7 +139,7 @@ fpvsim-working/
 │   └── video.hpp      # Analog video signal system (FPV interference effects)
 ├── tests/
 │   └── physics_test.cpp  # 48 headless physics tests
-├── Makefile           # Build: wenafpv, test, install, clean
+├── Makefile           # Build: wenafpv, test, install (sudo-safe), clean
 ├── README.md          # User documentation
 ├── UPDATES.md         # Change log (physics fix for spurious lift)
 ├── RESUME_FOR_AI.md   # AI context resume
@@ -132,6 +160,9 @@ fpvsim-working/
 - ✅ VID HUD positioned correctly under battery MAH
 - ✅ Texture randomization applied to all 5 maps
 - ✅ Props lowering setting works, persists, verified with `--debug-props-lowering`
+- ✅ Procedural prop overlay verified with `--verify-props` (pixel readback + ASCII dumps; FOV120/90 keep props out of frame)
+- ✅ Overlay GPU cost measured with `--bench-props 300`: ≤0.17 ms/frame on HD 520 (target <0.3 ms)
+- ✅ `make clean && sudo make install` works; the install rule hands the root-built binary back to the invoking user (`chown $SUDO_USER`), so the next normal `make` doesn't hit permission errors
 
 ---
 
@@ -226,6 +257,15 @@ Key settings:
 
 # Debug props lowering verification
 ./wenafpv --debug-props-lowering
+
+# Verify prop overlay placement/appearance (renders via the production shader, then exits)
+./wenafpv --verify-props
+
+# Benchmark the overlay's GPU cost (batched GL timer query, N draws per run)
+./wenafpv --bench-props 300
+
+# Build from scratch and install to /usr (binary ownership is fixed back to the invoking user)
+make clean && sudo make install
 ```
 
 ---

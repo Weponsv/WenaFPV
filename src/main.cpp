@@ -9,8 +9,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <string>
 #include <vector>
+#include <fstream>
 
 #include "config.hpp"
 #include "sim.hpp"
@@ -306,15 +308,24 @@ void main(){
 
 static const char* DRONE_SHADOW_FS = R"(#version 330 core
 in float vFade;
+uniform int uShadowFlat;
 out vec4 oColor;
 void main(){
-    // Dark semi-transparent shadow (40% black), faded by height
-    float alpha = 0.4 * vFade;
+    // Dark semi-transparent shadow (40% black), faded by height.
+    // When uShadowFlat==1 (debug mode), output constant bright alpha with no fade.
+    float alpha;
+    if (uShadowFlat == 1) {
+        alpha = 0.8f;
+    } else {
+        alpha = 0.4f * vFade;
+    }
     oColor = vec4(0.0, 0.0, 0.0, alpha);
 }
 )";
 
-// Propeller overlay shader - renders spinning props in FPV view with motion blur
+// Propeller overlay shader - one quad per prop, procedural blades + analytic motion blur.
+// The quad is in the prop plane; the fragment shader works in polar coordinates so the
+// blade shape and the angular blur are resolution independent and cheap.
 static const char* PROP_OVERLAY_VS = R"(#version 330 core
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNrm;
@@ -323,40 +334,16 @@ layout(location=3) in float aMat;
 layout(location=4) in float aPropIdx;
 uniform mat4 uVP;
 uniform mat4 uView;
-uniform float uTime;
-uniform float uRPM[4];
-uniform float uOpacity;
-uniform int uBlades;
-uniform vec3 uSunDir;
 out vec3 vWorld;
 out vec3 vNrm;
 out vec3 vCol;
 out float vPropIdx;
-out float vRPM;
-out float vBlades;
 void main(){
     vWorld = aPos;
     vNrm = aNrm;
     vCol = aCol;
     vPropIdx = aPropIdx;
-    vRPM = uRPM[int(aPropIdx + 0.5)];
-    vBlades = float(uBlades);
-    
-    vec3 pos = aPos;
-    // Spin propellers (indices 0-3)
-    if (aPropIdx >= 0.0 && aPropIdx <= 3.0) {
-        float rpm = uRPM[int(aPropIdx + 0.5)];
-        // Alternate direction: 0,3 = CW; 1,2 = CCW (or vice versa)
-        float dir = (aPropIdx == 0.0 || aPropIdx == 3.0) ? 1.0 : -1.0;
-        float angle = rpm * (2.0 * 3.14159 / 60.0) * uTime * dir;
-        // Rotate around Y axis
-        float ca = cos(angle);
-        float sa = sin(angle);
-        pos = vec3(pos.x * ca + pos.z * sa, pos.y, -pos.x * sa + pos.z * ca);
-    }
-    // Apply view transform (camera tilt, no translation)
-    vec4 viewPos = uView * vec4(pos, 1.0);
-    gl_Position = uVP * viewPos;
+    gl_Position = uVP * (uView * vec4(aPos, 1.0));
 }
 )";
 
@@ -365,45 +352,88 @@ in vec3 vWorld;
 in vec3 vNrm;
 in vec3 vCol;
 in float vPropIdx;
-in float vRPM;
-in float vBlades;
 uniform float uOpacity;
-uniform vec3 uSunDir;
 uniform float uTime;
+uniform int uBlades;
+uniform int uDebugFlat;
+uniform float uPropRadius;
+uniform vec3 uPropCenter[4];
+uniform float uRPM[4];
+uniform float uSpinPhase[4];
+uniform vec3 uSunDir;
 out vec4 oColor;
+
+const float PI = 3.14159265359;
+
 void main(){
-    vec3 n = normalize(vNrm);
-    vec3 col = vCol;
-    
-    // Calculate lighting
-    float diff = max(dot(n, uSunDir), 0.0);
-    float amb = 0.3;
-    col = col * (amb + diff * 0.7);
-    
-    // Propeller motion blur: at high RPM, fade blades and show disc
-    float maxRPM = 30000.0;
-    float rpmNorm = clamp(vRPM / maxRPM, 0.0, 1.0);
-    
-    // Alpha: blades fade out, disc fades in
-    float bladeAlpha = 1.0 - smoothstep(0.3, 0.8, rpmNorm);
-    float discAlpha = smoothstep(0.3, 0.8, rpmNorm);
-    
-    // Determine if this is a blade or hub/disc based on propIdx
-    // propIdx 0-3 = propellers, 4 = motors, 5 = front arms
-    float alpha;
-    if (vPropIdx >= 0.0 && vPropIdx <= 3.0) {
-        // Propeller: blend between blades and disc
-        // Use a subtle wobble on disc brightness at high RPM
-        float wobble = 1.0 + 0.05 * sin(uTime * vRPM * 0.001 * vBlades) * discAlpha;
-        // Increased disc alpha from 0.3 to 0.5 for better visibility
-        alpha = bladeAlpha * wobble + discAlpha * 0.5 * wobble;
-    } else {
-        // Motors and arms: fully opaque
-        alpha = 1.0;
+    // Motors (4) and front arms (5): keep the original simple lit look.
+    if (vPropIdx > 3.5) {
+        vec3 n = normalize(vNrm);
+        float diff = max(dot(n, uSunDir), 0.0);
+        vec3 col = vCol * (0.30 + 0.70 * diff);
+        oColor = vec4(col, uOpacity * 0.01);
+        return;
     }
-    
-    alpha *= uOpacity / 100.0;
-    oColor = vec4(col, alpha);
+
+    int pi = int(vPropIdx + 0.5);
+    vec2 q = vWorld.xz - uPropCenter[pi].xz;
+    float rn = length(q) / uPropRadius;
+    if (rn > 1.02) discard;              // most of the quad corner is empty
+
+    float theta = atan(q.y, q.x);
+    float rr = clamp((rn - 0.12) / 0.88, 0.0, 1.0);
+
+    // Tapered blade: narrow root, widest around half radius, then tapered rounded tip.
+    float root = smoothstep(0.10, 0.17, rn);
+    float halfW = mix(0.22, 0.50, smoothstep(0.0, 0.48, rr));
+    halfW = mix(halfW, 0.110, smoothstep(0.56, 1.0, rr));
+    halfW *= root;
+    float tip = 1.0 - smoothstep(0.93, 1.0, rn);
+
+    float pitch = 2.0 * PI / float(max(uBlades, 2));
+    float rpm = uRPM[pi];
+    float dir = (pi == 0 || pi == 3) ? 1.0 : -1.0;  // same CW/CCW pairing as before
+    float omega = rpm * (2.0 * PI / 60.0);
+    float phase = mod(dir * uSpinPhase[pi], pitch);
+    float sweep = 0.14 * rr * rr;                    // gentle blade sweep
+    float a = theta - sweep - phase;
+    float m = mod(a, pitch);
+    float d = min(m, pitch - m);                     // angle to nearest blade centre
+
+    // Analytic angular motion blur = average over the shutter arc. At high RPM this
+    // becomes the translucent swept disc, without any multi-tap loop.
+    float blur = clamp(omega * (1.0 / 240.0), 0.0, pitch);
+    float aa = fwidth(rn) / max(rn, 0.08);           // ~1 pixel in angular units
+    float soft = max(max(aa, blur * 0.5), 1e-4);
+    float blade = clamp((halfW - d) / soft + 0.5, 0.0, 1.0);
+    blade = blade * blade * (3.0 - 2.0 * blade);     // smoothstep, never jagged
+    blade *= tip;
+    blade *= (2.0 * halfW) / max(2.0 * halfW + blur, 1e-4);  // conserve blade energy
+
+    float hub = 1.0 - smoothstep(0.145, 0.175, rn);
+    float alphaMask = max(blade, hub * 0.96);
+
+    // Two-sided carbon shading: lighter grey so the blades read against sky and ground,
+    // with a bright edge sheen and a faint tip highlight.
+    float sun = max(dot(vec3(0.0, 1.0, 0.0), normalize(uSunDir)), 0.0);
+    float across = clamp(d / max(halfW, 1e-3), 0.0, 1.0);
+    vec3 col = mix(vec3(0.12, 0.13, 0.16), vec3(0.40, 0.42, 0.47),
+                   smoothstep(0.10, 1.0, rn) * 0.85);
+    col *= 0.62 + 0.38 * sun;
+    col += vec3(0.26, 0.28, 0.33) * smoothstep(0.68, 1.0, across) * 0.75;
+    col = mix(col, vec3(0.72, 0.76, 0.82), smoothstep(0.86, 0.94, rn) * 0.32);
+    col = mix(col, vec3(0.36, 0.38, 0.42), hub * 0.65);
+
+    if (uDebugFlat != 0) {
+        vec3 flatCol = vec3(1.0, 0.0, 0.0);
+        if (pi == 1) flatCol = vec3(0.0, 1.0, 0.0);
+        else if (pi == 2) flatCol = vec3(0.0, 0.0, 1.0);
+        else if (pi == 3) flatCol = vec3(1.0, 1.0, 0.0);
+        oColor = vec4(flatCol * alphaMask, 1.0);
+        return;
+    }
+
+    oColor = vec4(col, alphaMask * (uOpacity * 0.01));
 }
 )";
 
@@ -1348,10 +1378,52 @@ static std::vector<float> buildDroneMesh(const DroneParams& P) {
     return v;
 }
 
+struct PropOverlayLayout {
+    V3 cam;            // camera lens in drone-local space
+    V3 props[2];       // front-right, front-left prop centres
+    float propRadius;  // blade tip radius (m)
+    int blades;
+};
+
+static PropOverlayLayout propOverlayLayout(const DroneParams& P, int droneSize) {
+    PropOverlayLayout L{};
+    float armLen = P.armLength;
+    float armCoord = armLen * 0.70710678f;
+
+    // Camera mount per preset (metres above the arm plane / forward of the body centre).
+    // These are deliberately kept next to each other so they are easy to tune:
+    //   * 5"    : 40.0 mm forward, 29.0 mm high
+    //   * 3.5"  : 27.0 mm forward, 28.5 mm high
+    // Other presets scale the 3.5" mount by arm length.
+    bool is5 = (droneSize == 4) || (droneSize < 0 && armLen >= 0.095f);
+    bool is35 = (droneSize == 3) || (droneSize < 0 && armLen >= 0.065f);
+    float camForward;
+    float camHeight;
+    if (is5) {
+        camForward = 0.0400f;
+        camHeight = 0.0290f;
+    } else if (is35) {
+        camForward = 0.0270f;
+        camHeight = 0.0285f;
+    } else {
+        camForward = 0.0270f * (armLen / 0.075f);
+        camHeight = 0.0285f;
+    }
+
+    const float propY = 0.022f;          // motor top / prop plane
+    L.cam = {0.f, camHeight, -camForward};
+    L.props[0] = { armCoord, propY, -armCoord };  // front-right
+    L.props[1] = {-armCoord, propY, -armCoord };  // front-left
+    L.propRadius = armLen * 0.40f;       // 5" = 42 mm, 3.5" = 30 mm
+    L.blades = 3;                        // 3-blade freestyle props for both presets
+    return L;
+}
+
+
 // Build propeller overlay mesh (only parts in front of camera: props, motors, front arms)
 // Returns vertex data: pos(3), normal(3), color(3), material(1), propIndex(1) = 11 floats per vertex
 // propIndex: 0-3 for each prop, 4 for motors, 5 for front arms, -1 for other
-static std::vector<float> buildPropOverlayMesh(const DroneParams& P) {
+static std::vector<float> buildPropOverlayMesh(const DroneParams& P, int droneSize) {
     std::vector<float> v;
     v.reserve(300 * 3 * 11); // target under 300 triangles
     
@@ -1397,53 +1469,14 @@ static std::vector<float> buildPropOverlayMesh(const DroneParams& P) {
         }
     };
     
-    // Helper to add a thin disc (for propellers) with 2 or 3 blades
-    auto addPropDisc = [&](const V3& center, float radius, const V3& normal, const V3& color, float mat, float propIdx, int blades = 3) {
-        V3 up = normal;
-        V3 right, forward;
-        if (std::fabs(up.y) > 0.9f) {
-            right = {1, 0, 0};
-            forward = {0, 0, 1};
-        } else {
-            right = normalize3(cross({0, 1, 0}, up));
-            forward = cross(up, right);
-        }
-        
-        // Create individual blades as thin triangles
-        for (int b = 0; b < blades; ++b) {
-            float bladeAngle = 2.f * PI * b / blades;
-            V3 bladeDir = right * std::cos(bladeAngle) + forward * std::sin(bladeAngle);
-            V3 bladePerp = right * (-std::sin(bladeAngle)) + forward * std::cos(bladeAngle);
-            
-            // Blade dimensions: length = radius, width at root = radius * 0.25, width at tip = radius * 0.1
-            float bladeLen = radius;
-            float rootWidth = radius * 0.25f;
-            float tipWidth = radius * 0.1f;
-            
-            V3 rootL = center - bladePerp * rootWidth;
-            V3 rootR = center + bladePerp * rootWidth;
-            V3 tipL = center + bladeDir * bladeLen - bladePerp * tipWidth;
-            V3 tipR = center + bladeDir * bladeLen + bladePerp * tipWidth;
-            
-            // Two triangles per blade (top and bottom)
-            pushQuad11(v, rootL, rootR, tipR, tipL, up, color, mat, propIdx);
-            pushQuad11(v, rootL, rootR, tipR, tipL, V3{-up.x, -up.y, -up.z}, color, mat, propIdx);
-        }
-        
-        // Hub (small disc at center)
-        float hubRadius = radius * 0.2f;
-        const int hubSides = 6;
-        for (int pass = 0; pass < 2; ++pass) {
-            V3 n = pass == 0 ? up : V3{-up.x, -up.y, -up.z};
-            for (int i = 1; i < hubSides - 1; ++i) {
-                float a0 = 2.f * PI * i / hubSides;
-                float a1 = 2.f * PI * (i + 1) / hubSides;
-                V3 v0 = center + right * (hubRadius * std::cos(0)) + forward * (hubRadius * std::sin(0));
-                V3 v1 = center + right * (hubRadius * std::cos(a0)) + forward * (hubRadius * std::sin(a0));
-                V3 v2 = center + right * (hubRadius * std::cos(a1)) + forward * (hubRadius * std::sin(a1));
-                pushTri11(v, v0, v1, v2, n, color, mat, propIdx);
-            }
-        }
+    // One quad per propeller. The quad is in the prop plane and two-sided (culling is
+    // disabled); the fragment shader draws the tapered blades and the motion blur.
+    auto addPropQuad = [&](const V3& center, float radius, const V3& color, float mat, float propIdx) {
+        V3 a = {center.x - radius, center.y, center.z - radius};
+        V3 b = {center.x + radius, center.y, center.z - radius};
+        V3 c = {center.x + radius, center.y, center.z + radius};
+        V3 d = {center.x - radius, center.y, center.z + radius};
+        pushQuad11(v, a, b, c, d, {0, 1, 0}, color, mat, propIdx);
     };
     
     // Helper to add an oriented box (for arms at 45 degrees)
@@ -1470,21 +1503,14 @@ static std::vector<float> buildPropOverlayMesh(const DroneParams& P) {
     float mat = 1.0f;
     
     // Sizes based on drone preset (5" or 3.5")
+    PropOverlayLayout layout = propOverlayLayout(P, droneSize);
     float armLen = P.armLength;
     float armCoord = armLen * 0.70710678f;
-    float bodyDepth = armLen * 0.25f;
-    float bodyHeight = 0.025f;
     float armWidth = armLen * 0.10f;
     float armHeight = 0.010f;
-    float armLength3D = armLen * 0.95f;
     float motorRadius = armLen * 0.06f;
     float motorHeight = 0.02f;
-    float propRadius = armLen * 0.45f;
-    float cameraSize = armLen * 0.15f;
-    
-    // Camera position in drone-local frame - MATCH MAIN CAMERA: {0, 0.03f, -0.07f}
-    V3 camLocalPos = {0, 0.03f, -0.07f};
-    
+
     // 4 arms in X layout - front two arms are indices 0, 1 (front-right, front-left)
     V3 armDirs[4] = {
         { armCoord, 0, -armCoord }, // front-right (index 0)
@@ -1492,14 +1518,12 @@ static std::vector<float> buildPropOverlayMesh(const DroneParams& P) {
         {-armCoord, 0,  armCoord }, // back-left (index 2)
         { armCoord, 0,  armCoord }, // back-right (index 3)
     };
-    
-    // Ensure front props are IN FRONT of camera (more negative Z) for visibility
-    // Camera is at camLocalPos.z = -0.07. Front props should be at z < -0.07.
-    // Use actual arm Z or 3cm in front of camera, whichever is more forward.
-    float propZ = std::min(-armCoord, camLocalPos.z - 0.03f); // 3cm in front of camera
-    
+
+    // Props live at the motor positions in the arm plane; the camera mount in the preset
+    // is what places them at the screen edge (no artificial forward offset).
+    float propZ = layout.props[0].z;
+
     // Add front arm portions (only front two arms: indices 0, 1)
-    // Extend arms to propZ position
     for (int i = 0; i < 2; ++i) {
         V3 dir = normalize3({armDirs[i].x, 0, propZ}); // direction to prop position
         V3 up = {0, 1, 0};
@@ -1509,35 +1533,38 @@ static std::vector<float> buildPropOverlayMesh(const DroneParams& P) {
         V3 halfExtents = {armLenToProp * 0.5f, armHeight * 0.5f, armWidth * 0.5f};
         addOrientedBox(center, halfExtents, dir, up, right, armColor, mat, 5.f); // propIdx = 5 for front arms
     }
-    
+
     // 4 motors at arm ends - only front two (indices 0, 1)
     for (int i = 0; i < 2; ++i) {
         V3 motorPos = {armDirs[i].x, motorHeight * 0.5f, propZ};
         addCylinder(motorPos - V3{0, motorHeight * 0.5f, 0}, motorRadius, motorHeight, motorColor, mat, {0, 1, 0}, 4.f); // propIdx = 4 for motors
     }
-    
-    // 4 propellers at motor positions - only front two (indices 0, 1)
+
+    // One quad per front prop. The shader draws the 3 blades and hub procedurally.
     for (int i = 0; i < 2; ++i) {
-        V3 propPos = {armDirs[i].x, motorHeight + 0.002f, propZ};
-        addPropDisc(propPos, propRadius, {0, 1, 0}, propColor, mat, (float)i, 3); // 3 blades per prop
+        addPropQuad(layout.props[i], layout.propRadius, propColor, mat, (float)i);
     }
-    
+
     return v;
 }
 
 // Raycast downward from a point to find the nearest surface in the world
 // Returns true if hit, sets outHitY to the Y coordinate of the hit surface,
 // and outNormal to the surface normal
-static bool raycastDown(const V3& origin, const std::vector<Box>& world, const std::vector<ThinCylinder>& thinCylinders, float maxDist, float& outHitY, V3& outNormal) {
+static bool raycastDown(const V3& origin, const std::vector<Box>& world, const std::vector<ThinCylinder>& thinCylinders, float maxDist, float& outHitY, V3& outNormal, int& outHitBoxIdx, int& outHitFace, V3& outHitPos) {
+    outHitBoxIdx = -1;
+    outHitFace = -1; // 0=top,1=bottom,2=+x,3=-x,4=+z,5=-z
     float bestT = maxDist;
     bool hit = false;
     V3 rayDir = {0, -1, 0}; // straight down
     
     // Check boxes
-    for (const Box& b : world) {
+    for (int bi = 0; bi < (int)world.size(); ++bi) {
+        const Box& b = world[bi];
         // Ray-box intersection (slab method)
         // Ray: origin + t * rayDir, t >= 0
         float tmin = -1e30f, tmax = 1e30f;
+        int exitFace = -1;
         
         // X slab
         if (rayDir.x != 0) {
@@ -1555,6 +1582,8 @@ static bool raycastDown(const V3& origin, const std::vector<Box>& world, const s
             float ty1 = (b.mn.y - origin.y) / rayDir.y;
             float ty2 = (b.mx.y - origin.y) / rayDir.y;
             if (ty1 > ty2) std::swap(ty1, ty2);
+            // For downward ray (rayDir.y=-1): ty1 = origin.y - b.mx.y (top entry), ty2 = origin.y - b.mn.y (bottom exit)
+            if (tmin == ty1) exitFace = 0; // hit top face first
             tmin = std::max(tmin, ty1);
             tmax = std::min(tmax, ty2);
         } else if (origin.y < b.mn.y || origin.y > b.mx.y) {
@@ -1573,14 +1602,28 @@ static bool raycastDown(const V3& origin, const std::vector<Box>& world, const s
         }
         
         if (tmin <= tmax && tmax >= 0 && tmin < bestT) {
-            // Hit! The entry point is at tmin (or tmax if origin inside)
+            // Hit! Determine which face was entered.
             float t = tmin >= 0 ? tmin : tmax;
             if (t >= 0 && t < bestT) {
                 bestT = t;
                 hit = true;
-                // For downward ray, we hit the top face (y = b.mx.y)
-                outHitY = b.mx.y;
-                outNormal = {0, 1, 0}; // top face normal
+                outHitBoxIdx = bi;
+                // For a downward ray: if origin is above the box top, we hit the top face;
+                // if origin is inside the box vertically, we hit the bottom face.
+                if (origin.y > b.mx.y) {
+                    outHitFace = 0; // top face
+                    outHitY = b.mx.y;
+                    outNormal = {0, 1, 0};
+                } else if (origin.y > b.mn.y) {
+                    outHitFace = 1; // bottom face (ray started inside box vertically)
+                    outHitY = b.mn.y;
+                    outNormal = {0, 1, 0};
+                } else {
+                    outHitFace = 0; // fallback: top face
+                    outHitY = b.mx.y;
+                    outNormal = {0, 1, 0};
+                }
+                outHitPos = {origin.x, outHitY, origin.z};
             }
         }
     }
@@ -1620,6 +1663,229 @@ static bool raycastDown(const V3& origin, const std::vector<Box>& world, const s
     }
     
     return hit;
+}
+
+// Last view-projection matrix, updated each frame for the F9 shadow dump
+static float gLastVP[16] = {0};
+
+// ============================================================ shadow debug dump (F9 key)
+// Writes shadow_dump.txt with per-frame shadow diagnostics and an ASCII dump
+// of the shadow-only render from the actual camera view.
+static void dumpShadowFrame(const Sim& sim, const Config& cfg, const DroneState& d,
+                            const float VP[16], int dw, int dh,
+                            GLuint prog, GLuint vao, GLsizei verts,
+                            GLuint fbo, GLuint tex, GLuint depth) {
+    std::ofstream out("shadow_dump.txt");
+    if (!out) {
+        std::fprintf(stderr, "DEBUG: could not open shadow_dump.txt for writing\n");
+        return;
+    }
+    auto pw = [&](const char* fmt, ...) {
+        va_list args; va_start(args, fmt);
+        char buf[4096];
+        vsnprintf(buf, sizeof buf, fmt, args);
+        va_end(args);
+        out << buf;
+        std::fputs(buf, stdout);
+    };
+
+    V3 sunDir = normalize3({0.45f, 0.85f, 0.30f});
+    float sunElev = std::asin(clampf(sunDir.y, -1.f, 1.f)) * 180.f / 3.14159265f;
+
+    // Speed
+    float speed = std::sqrt(d.vel.x*d.vel.x + d.vel.y*d.vel.y + d.vel.z*d.vel.z);
+
+    // Roll/pitch/yaw from quaternion
+    V3 up = rotate(d.q, {0, 1, 0});
+    V3 fwd = rotate(d.q, {0, 0, -1});
+    float roll = std::atan2(2.f*(d.q.w*d.q.x + d.q.y*d.q.z), 1.f - 2.f*(d.q.x*d.q.x + d.q.y*d.q.y)) * 180.f / 3.14159265f;
+    float pitch = std::asin(clampf(2.f*(d.q.w*d.q.y - d.q.z*d.q.x), -1.f, 1.f)) * 180.f / 3.14159265f;
+    float yaw = std::atan2(2.f*(d.q.w*d.q.z + d.q.x*d.q.y), 1.f - 2.f*(d.q.y*d.q.y + d.q.z*d.q.z)) * 180.f / 3.14159265f;
+
+    pw("=== WenaFPV Shadow Debug Dump ===\n");
+    pw("Drone position: (%.3f, %.3f, %.3f)  altitude=%.3f  speed=%.2f m/s\n", d.pos.x, d.pos.y, d.pos.z, d.pos.y, speed);
+    pw("Drone orientation: quat=(%.3f,%.3f,%.3f,%.3f)  roll=%.1f deg  pitch=%.1f deg  yaw=%.1f deg\n",
+       d.q.w, d.q.x, d.q.y, d.q.z, roll, pitch, yaw);
+    pw("Sun direction L: (%.3f, %.3f, %.3f)  elevation=%.1f deg\n", sunDir.x, sunDir.y, sunDir.z, sunElev);
+    pw("Sky/light sun direction: (0.450, 0.850, 0.300) -- SAME as shadow sun\n");
+
+    // Raycast
+    int hitBoxIdx = -1, hitFace = -1;
+    V3 hitPos{};
+    float hitY = 0.f;
+    V3 hitNormal{0,1,0};
+    float maxShadowDist = 60.0f;
+    bool rayHit = raycastDown(d.pos, sim.world, sim.thinCylinders, maxShadowDist, hitY, hitNormal, hitBoxIdx, hitFace, hitPos);
+
+    const char* faceNames[6] = {"top","bottom","+x","-x","+z","-z"};
+    const char* objType = hitBoxIdx >= 0 ? "box" : "none";
+    pw("Raycast: origin=(%.3f,%.3f,%.3f)  dir=(0,-1,0)  maxDist=%.1f\n", d.pos.x, d.pos.y, d.pos.z, maxShadowDist);
+    if (rayHit) {
+        pw("  HIT: boxIdx=%d  type=%s  face=%s  hitPos=(%.3f,%.3f,%.3f)  hitY=%.3f  hitNormal=(%.3f,%.3f,%.3f)\n",
+           hitBoxIdx, objType, faceNames[hitFace >= 0 ? hitFace : 0], hitPos.x, hitPos.y, hitPos.z, hitY,
+           hitNormal.x, hitNormal.y, hitNormal.z);
+        float dotNL = dot(hitNormal, V3{-sunDir.x, -sunDir.y, -sunDir.z});
+        pw("  dot(normal, -L) = %.4f\n", dotNL);
+    } else {
+        pw("  NO HIT\n");
+    }
+
+    // Shadow plane
+    float planeHeight = rayHit ? hitY + 0.015f : d.pos.y - 0.015f;
+    V3 planeNormal = rayHit ? hitNormal : V3{0,1,0};
+    pw("Shadow plane: point=(%.3f,%.3f,%.3f)  normal=(%.3f,%.3f,%.3f)\n",
+       d.pos.x, planeHeight, d.pos.z, planeNormal.x, planeNormal.y, planeNormal.z);
+
+    // Project drone mesh vertices
+    std::vector<float> mesh = buildDroneMesh(sim.P);
+    int nTris = (int)(mesh.size() / 30);
+    float denom = dot(sunDir, planeNormal);
+    pw("Projection: denom=dot(L,normal)=%.4f  nTris=%d\n", denom, nTris);
+
+    float minX=1e9f, maxX=-1e9f, minZ=1e9f, maxZ=-1e9f;
+    float maxDist = 0.f;
+    int clippedVerts = 0;
+    for (int tri = 0; tri < nTris; ++tri) {
+        for (int i = 0; i < 3; ++i) {
+            int base = tri * 30 + i * 10;
+            V3 local = {mesh[base], mesh[base+1], mesh[base+2]};
+            V3 worldPos = {
+                local.x + d.pos.x,  // simplified: model is identity for position only, rotation not applied here for bounds
+                local.y + d.pos.y,
+                local.z + d.pos.z
+            };
+            // Apply rotation (approximate for bounds)
+            V3 rpos = rotate(d.q, local);
+            worldPos = {d.pos.x + rpos.x, d.pos.y + rpos.y, d.pos.z + rpos.z};
+            float t = (planeHeight - dot(worldPos, planeNormal)) / denom;
+            V3 sPos = {worldPos.x + sunDir.x * t, worldPos.y + sunDir.y * t, worldPos.z + sunDir.z * t};
+            float dist = std::sqrt((sPos.x-d.pos.x)*(sPos.x-d.pos.x) + (sPos.z-d.pos.z)*(sPos.z-d.pos.z));
+            if (dist > maxDist) maxDist = dist;
+            minX = std::min(minX, sPos.x); maxX = std::max(maxX, sPos.x);
+            minZ = std::min(minZ, sPos.z); maxZ = std::max(maxZ, sPos.z);
+        }
+    }
+    pw("Projected shadow bounds: x=[%.3f,%.3f]  z=[%.3f,%.3f]  maxVertexDist=%.3f m\n", minX, maxX, minZ, maxZ, maxDist);
+    pw("Drone diagonal approx: %.2f m (armLen=%.3f)\n", sim.P.armLength * 1.5f, sim.P.armLength);
+    if (maxDist > sim.P.armLength * 3.0f)
+        pw("  *** FLAG: shadow extent > 3x drone diagonal!\n");
+    if (maxDist > 3.0f)
+        pw("  *** FLAG: shadow vertex > 3 m from drone!\n");
+    if (rayHit && std::abs(dot(planeNormal, V3{-sunDir.x,-sunDir.y,-sunDir.z})) < 0.3f)
+        pw("  *** FLAG: dot(normal, -L) < 0.3 (grazing projection)!\n");
+
+    // GL state at shadow draw time
+    GLboolean cull = glIsEnabled(GL_CULL_FACE);
+    GLint cullMode = 0; glGetIntegerv(GL_CULL_FACE_MODE, &cullMode);
+    GLboolean depthTest = glIsEnabled(GL_DEPTH_TEST);
+    GLint depthFunc = 0; glGetIntegerv(GL_DEPTH_FUNC, &depthFunc);
+    GLboolean blend = glIsEnabled(GL_BLEND);
+    GLboolean stencil = glIsEnabled(GL_STENCIL_TEST);
+    GLint stencilFunc = 0, stencilRef = 0, stencilMask = 0;
+    glGetIntegerv(GL_STENCIL_FUNC, &stencilFunc);
+    glGetIntegerv(GL_STENCIL_REF, &stencilRef);
+    glGetIntegerv(GL_STENCIL_WRITEMASK, &stencilMask);
+    pw("GL state: cullFace=%s mode=%s depthTest=%s depthFunc=%s blend=%s stencil=%s\n",
+       cull ? "ON" : "OFF", cullMode == GL_BACK ? "BACK" : (cullMode == GL_FRONT ? "FRONT" : "FRONT_AND_BACK"),
+       depthTest ? "ON" : "OFF", depthFunc == GL_LEQUAL ? "LEQUAL" : (depthFunc == GL_LESS ? "LESS" : "OTHER"),
+       blend ? "ON" : "OFF", stencil ? "ON" : "OFF");
+    pw("  stencilFunc=%d ref=%d mask=%d\n", stencilFunc, stencilRef, stencilMask);
+
+    // Render shadow-only to FBO with flat bright color
+    gl.glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glViewport(0, 0, dw, dh);
+    glClearColor(0.f, 0.f, 0.f, 0.f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_FALSE);
+
+    GLint uVP = gl.glGetUniformLocation(prog, "uVP");
+    GLint uModel = gl.glGetUniformLocation(prog, "uModel");
+    GLint uSun = gl.glGetUniformLocation(prog, "uSunDir");
+    GLint uHeight = gl.glGetUniformLocation(prog, "uShadowHeight");
+    GLint uPlane = gl.glGetUniformLocation(prog, "uPlaneNormal");
+    GLint uFlat = gl.glGetUniformLocation(prog, "uShadowFlat");
+
+    // Build model matrix (same as shadow pass)
+    V3 xAxis = rotate(d.q, {1, 0, 0});
+    V3 yAxis = rotate(d.q, {0, 1, 0});
+    V3 zAxis = rotate(d.q, {0, 0, 1});
+    float model[16] = {
+        xAxis.x, xAxis.y, xAxis.z, d.pos.x,
+        yAxis.x, yAxis.y, yAxis.z, d.pos.y,
+        zAxis.x, zAxis.y, zAxis.z, d.pos.z,
+        0, 0, 0, 1
+    };
+
+    gl.glUseProgram(prog);
+    gl.glUniformMatrix4fv(uVP, 1, GL_FALSE, VP);
+    gl.glUniformMatrix4fv(uModel, 1, GL_FALSE, model);
+    gl.glUniform3f(uSun, sunDir.x, sunDir.y, sunDir.z);
+    gl.glUniform1f(uHeight, planeHeight);
+    gl.glUniform3f(uPlane, planeNormal.x, planeNormal.y, planeNormal.z);
+    gl.glUniform1i(uFlat, 1);
+    gl.glBindVertexArray(vao);
+    glDrawArrays(GL_TRIANGLES, 0, verts);
+
+    // Restore state
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_CULL_FACE);
+
+    // Read back pixels
+    std::vector<uint8_t> rgba((size_t)dw * dh * 4);
+    glFinish();
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glReadPixels(0, 0, dw, dh, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+
+    const char* RAMP = " .:-=+*#%@";
+    pw("\nShadow-only ASCII dump (100x40, alpha ramp \"%s\"):\n", RAMP);
+    out << "Shadow-only ASCII dump (100x40):\n";
+    int outW = 100, outH = 40;
+    out << "+";
+    for (int i = 0; i < outW; ++i) out << "-";
+    out << "+\n";
+    pw("+");
+    for (int i = 0; i < outW; ++i) pw("-");
+    pw("+\n");
+    for (int row = 0; row < outH; ++row) {
+        int sy0 = (row * dh) / outH;
+        int sy1 = ((row + 1) * dh) / outH;
+        if (sy1 <= sy0) sy1 = sy0 + 1;
+        out << "|"; pw("|");
+        for (int col = 0; col < outW; ++col) {
+            int sx0 = (col * dw) / outW;
+            int sx1 = ((col + 1) * dw) / outW;
+            if (sx1 <= sx0) sx1 = sx0 + 1;
+            int sum = 0, count = 0;
+            for (int y = sy0; y < sy1 && y < dh; ++y) {
+                int srcY = dh - 1 - y;
+                for (int x = sx0; x < sx1 && x < dw; ++x) {
+                    sum += rgba[((srcY * dw) + x) * 4 + 3];
+                    count++;
+                }
+            }
+            int a = count ? sum / count : 0;
+            int idx = (a * 10) / 256;
+            if (idx < 0) idx = 0; if (idx > 9) idx = 9;
+            out << RAMP[idx]; pw("%c", RAMP[idx]);
+        }
+        out << "|\n"; pw("|\n");
+    }
+    out << "+";
+    for (int i = 0; i < outW; ++i) out << "-";
+    out << "+\n";
+    pw("+");
+    for (int i = 0; i < outW; ++i) pw("-");
+    pw("+\n");
+
+    gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    pw("\n=== shadow_dump.txt written ===\n");
+    out.close();
 }
 
 // VideoSignalState is updated every frame; kept as a persistent variable in main().
@@ -2387,49 +2653,21 @@ static float applyDeadband(float x, float db) {
     return (x < 0 ? -1.f : 1.f) * (a - db) / (1.f - db);
 }
 
-// ============================================================ Debug Overlay Shader and Functions
+// ============================================================ Debug Overlay and Functions
 
-// Simple debug shader for prop overlay - flat color per prop, no blending, no culling
-static const char* DEBUG_PROP_OVERLAY_VS = R"(#version 330 core
-layout(location=0) in vec3 aPos;
-layout(location=1) in vec3 aNrm;
-layout(location=2) in vec3 aCol;
-layout(location=3) in float aMat;
-layout(location=4) in float aPropIdx;
-uniform mat4 uVP;
-uniform mat4 uView;
-out vec3 vCol;
-out float vPropIdx;
-void main(){
-    vCol = aCol;
-    vPropIdx = aPropIdx;
-    vec4 viewPos = uView * vec4(aPos, 1.0);
-    gl_Position = uVP * viewPos;
-}
-)";
-
-static const char* DEBUG_PROP_OVERLAY_FS = R"(#version 330 core
-in vec3 vCol;
-in float vPropIdx;
-out vec4 oColor;
-void main(){
-    // Bright distinct colors per prop: 0=red, 1=green, 2=blue, 3=yellow, 4=cyan, 5=magenta
-    int idx = int(vPropIdx + 0.5);
-    vec3 color;
-    if (idx == 0) color = vec3(1.0, 0.0, 0.0);        // prop 0 - red
-    else if (idx == 1) color = vec3(0.0, 1.0, 0.0);    // prop 1 - green
-    else if (idx == 2) color = vec3(0.0, 0.0, 1.0);    // prop 2 - blue
-    else if (idx == 3) color = vec3(1.0, 1.0, 0.0);    // prop 3 - yellow
-    else if (idx == 4) color = vec3(0.0, 1.0, 1.0);    // motors - cyan
-    else if (idx == 5) color = vec3(1.0, 0.0, 1.0);    // arms - magenta
-    else color = vCol;
-    oColor = vec4(color, 1.0);
-}
-)";
-
-static GLuint buildDebugPropOverlayProgram() {
-    return buildProgram(DEBUG_PROP_OVERLAY_VS, DEBUG_PROP_OVERLAY_FS, "debug-prop-overlay");
-}
+// Shared overlay helpers, implemented further down with the --verify-props harness.
+static void buildOverlayViewProj(float fov, float tilt, float lowering, int w, int h,
+                                 const V3& cam, float P_out[16], float V_out[16],
+                                 V3& right, V3& up, V3& back, float& tanH, float& tanV);
+static void renderPropOverlayToFbo(GLuint prog, GLuint vao, GLsizei verts, GLuint fbo,
+                                   int w, int h, const float P[16], const float V[16],
+                                   float time, const float rpm[4], float opacity, int blades,
+                                   const V3& sun, const PropOverlayLayout& L,
+                                   const GLint uVP, const GLint uView, const GLint uTime,
+                                   const GLint uRPM[4], const GLint uOpacity, const GLint uBlades,
+                                   const GLint uSun, const GLint uRadius,
+                                   const GLint uCenter[4], const GLint uSpin[4],
+                                   const GLint uDebugFlat, int debugFlat);
 
 // Write PPM file
 static void writePPM(const char* filename, int w, int h, const std::vector<uint8_t>& pixels) {
@@ -2549,6 +2787,7 @@ static void testUIVisibility(int dw, int dh, const char* label, bool withOverlay
 static void debugRenderPropOverlay(
     const Sim& sim,
     const Config& cfg,
+    GLuint progPropOverlay,
     GLuint vaoPropOverlay,
     GLsizei propOverlayMeshVerts,
     int windowWidth,
@@ -2562,114 +2801,61 @@ static void debugRenderPropOverlay(
     TestCase testCases[] = {
         {160.f, 33.f, "FOV160_Tilt33"},
     };
-    
-    // Build debug shader program
-    GLuint debugProg = buildDebugPropOverlayProgram();
-    GLint uDebugVP = gl.glGetUniformLocation(debugProg, "uVP");
-    GLint uDebugView = gl.glGetUniformLocation(debugProg, "uView");
-    
-    // Camera mount geometry (from drone preset) - MATCH MAIN CAMERA: {0, 0.03f, -0.07f}
-    float armLen = sim.P.armLength;
-    float armCoord = armLen * 0.70710678f;
-    float bodyHeight = 0.025f;
-    float bodyDepth = armLen * 0.25f;
-    float motorHeight = 0.02f;
-    float cameraSize = armLen * 0.15f;
-    V3 camLocalPos = {0, 0.03f, -0.07f};
-    
-    // Ensure front props are IN FRONT of camera for visibility (same logic as buildPropOverlayMesh)
-    float propZ = std::min(-armCoord, camLocalPos.z - 0.03f); // 3cm in front of camera
-    V3 propPositions[4] = {
-        { armCoord, motorHeight + 0.002f, propZ }, // front-right
-        {-armCoord, motorHeight + 0.002f, propZ }, // front-left
-        {-armCoord, motorHeight + 0.002f,  armCoord }, // back-left
-        { armCoord, motorHeight + 0.002f,  armCoord }, // back-right
-    };
-    
-    // Prop radius from preset
-    float propRadius = armLen * 0.45f; // 5" = ~63mm, 3.5" = ~45mm
-    
-    std::printf("\n========== DEBUG PROP OVERLAY ANALYSIS ==========\n");
-    std::printf("Camera mount: offset=(%.3f, %.3f, %.3f) tilt=%.1f deg\n", 
-                camLocalPos.x, camLocalPos.y, camLocalPos.z, cfg.camTilt);
-    std::printf("Arm length: %.3f m, Arm coord: %.3f m\n", armLen, armCoord);
-    std::printf("Prop radius: %.3f m (%.1f mm)\n", propRadius, propRadius * 1000.f);
-    std::printf("Motor height: %.3f m\n", motorHeight);
-    std::printf("Body height: %.3f m, Body depth: %.3f m, Camera size: %.3f m\n", bodyHeight, bodyDepth, cameraSize);
-    std::printf("\nProp positions relative to body (drone-local):\n");
+
+    // Flat debug path of the production shader, same layout as the overlay.
+    PropOverlayLayout L = propOverlayLayout(sim.P, cfg.droneSize);
+    GLint uVP = gl.glGetUniformLocation(progPropOverlay, "uVP");
+    GLint uView = gl.glGetUniformLocation(progPropOverlay, "uView");
+    GLint uTime = gl.glGetUniformLocation(progPropOverlay, "uTime");
+    GLint uOpacity = gl.glGetUniformLocation(progPropOverlay, "uOpacity");
+    GLint uBlades = gl.glGetUniformLocation(progPropOverlay, "uBlades");
+    GLint uSun = gl.glGetUniformLocation(progPropOverlay, "uSunDir");
+    GLint uRadius = gl.glGetUniformLocation(progPropOverlay, "uPropRadius");
+    GLint uDebugFlat = gl.glGetUniformLocation(progPropOverlay, "uDebugFlat");
+    GLint uRPM[4], uCenter[4], uSpin[4];
     for (int i = 0; i < 4; ++i) {
-        std::printf("  Prop %d: (%.3f, %.3f, %.3f)\n", i, propPositions[i].x, propPositions[i].y, propPositions[i].z);
+        char b[32];
+        std::snprintf(b, sizeof b, "uRPM[%d]", i); uRPM[i] = gl.glGetUniformLocation(progPropOverlay, b);
+        std::snprintf(b, sizeof b, "uPropCenter[%d]", i); uCenter[i] = gl.glGetUniformLocation(progPropOverlay, b);
+        std::snprintf(b, sizeof b, "uSpinPhase[%d]", i); uSpin[i] = gl.glGetUniformLocation(progPropOverlay, b);
     }
-    std::printf("Camera position (drone-local): (%.3f, %.3f, %.3f)\n", camLocalPos.x, camLocalPos.y, camLocalPos.z);
-    
+    float zeroRpm[4] = {0.f, 0.f, 0.f, 0.f};
+    V3 sun = normalize3({0.45f, 0.85f, 0.30f});
+
+    std::printf("\n========== DEBUG PROP OVERLAY ANALYSIS ==========\n");
+    std::printf("Camera mount: offset=(%.3f, %.3f, %.3f) tilt=%.1f deg\n",
+                L.cam.x, L.cam.y, L.cam.z, cfg.camTilt);
+    std::printf("Arm length: %.3f m, Prop radius: %.3f m (%.1f mm)\n",
+                sim.P.armLength, L.propRadius, L.propRadius * 1000.f);
+    std::printf("\nProp positions relative to body (drone-local):\n");
+    for (int i = 0; i < 2; ++i) {
+        std::printf("  Prop %d: (%.3f, %.3f, %.3f)\n", i, L.props[i].x, L.props[i].y, L.props[i].z);
+    }
+    std::printf("Camera position (drone-local): (%.3f, %.3f, %.3f)\n", L.cam.x, L.cam.y, L.cam.z);
+
     for (const auto& tc : testCases) {
         std::printf("\n--- Test Case: %s (FOV=%.0f, Tilt=%.0f) ---\n", tc.name, tc.fov, tc.tilt);
         
-        // Overlay projection: same FOV/aspect, near=0.002, far=1.0
+        // Same view/projection as the production overlay.
         float aspect = (float)windowWidth / (float)windowHeight;
-        float tanH = std::tan(rad(tc.fov) * 0.5f);
-        float tanV = tanH / aspect;
-        float overlayNear = 0.002f;
-        float overlayFar = 1.0f;
-        float P_overlay[16] = {0};
-        P_overlay[0] = 1.f / tanH;
-        P_overlay[5] = 1.f / tanV;
-        P_overlay[10] = (overlayFar + overlayNear) / (overlayNear - overlayFar);
-        P_overlay[11] = -1.f;
-        P_overlay[14] = 2.f * overlayFar * overlayNear / (overlayNear - overlayFar);
-        
-        // Main projection (for comparison) - computed but not used in this debug function
-        float mainNear = 0.05f;
-        float mainFar = 210.f; // qualityFar[0]
-        float P_main[16] = {0};
-        (void)P_main;
-        P_main[0] = 1.f / tanH;
-        P_main[5] = 1.f / tanV;
-        P_main[10] = (mainFar + mainNear) / (mainNear - mainFar);
-        P_main[11] = -1.f;
-        P_main[14] = 2.f * mainFar * mainNear / (mainNear - mainFar);
-        
-        // View matrix (camera tilt only, no translation)
-        float tiltRad = rad(tc.tilt);
-        float cosT = cosf(tiltRad);
-        float sinT = sinf(tiltRad);
-        V3 overlayRight = {1, 0, 0};
-        V3 overlayUp = {0, cosT, sinT};
-        V3 overlayBack = {0, -sinT, cosT};
-        float view[16] = {
-            overlayRight.x, overlayUp.x, overlayBack.x, 0,
-            overlayRight.y, overlayUp.y, overlayBack.y, 0,
-            overlayRight.z, overlayUp.z, overlayBack.z, 0,
-            -dot(overlayRight, camLocalPos), -dot(overlayUp, camLocalPos), -dot(overlayBack, camLocalPos), 1
-        };
-        
-        std::printf("Overlay projection: near=%.3f, far=%.3f, FOV=%.0f, aspect=%.3f\n", overlayNear, overlayFar, tc.fov, aspect);
-        std::printf("Main projection:    near=%.3f, far=%.3f, FOV=%.0f, aspect=%.3f\n", mainNear, mainFar, tc.fov, aspect);
-        
+        float P_overlay[16], view[16], tanH, tanV;
+        V3 overlayRight, overlayUp, overlayBack;
+        buildOverlayViewProj(tc.fov, tc.tilt, 0.f, windowWidth, windowHeight,
+                             L.cam, P_overlay, view, overlayRight, overlayUp, overlayBack, tanH, tanV);
+        std::printf("Overlay projection: near=0.002, far=1.0, FOV=%.0f, aspect=%.3f\n", tc.fov, aspect);
+
         // Transform prop positions to camera space and NDC
         std::printf("\nProp analysis:\n");
-        for (int i = 0; i < 4; ++i) {
-            V3 relPos = {propPositions[i].x - camLocalPos.x, propPositions[i].y - camLocalPos.y, propPositions[i].z - camLocalPos.z};
+        for (int i = 0; i < 2; ++i) {
+            V3 relPos = {L.props[i].x - L.cam.x, L.props[i].y - L.cam.y, L.props[i].z - L.cam.z};
             float cx = dot(overlayRight, relPos);
             float cy = dot(overlayUp, relPos);
             float cz = dot(overlayBack, relPos);
-            float dist = std::sqrt(cx*cx + cy*cy + cz*cz);
-            
-            // NDC with overlay projection
-            float ndcX_overlay = cx / (-cz * tanH);
-            float ndcY_overlay = cy / (-cz * tanV);
-            
-            // NDC with main projection
-            float ndcX_main = cx / (-cz * tanH);
-            float ndcY_main = cy / (-cz * tanV);
-            
-            // Check near plane clipping
-            bool clipped_overlay = (-cz) < overlayNear;
-            bool clipped_main = (-cz) < mainNear;
-            
-            std::printf("  Prop %d: cam=(%.3f, %.3f, %.3f) dist=%.3f NDC_overlay=(%.3f, %.3f) NDC_main=(%.3f, %.3f) clip_overlay=%s clip_main=%s\n",
-                        i, cx, cy, cz, dist, ndcX_overlay, ndcY_overlay, ndcX_main, ndcY_main,
-                        clipped_overlay ? "YES" : "NO", clipped_main ? "YES" : "NO");
+            float fwd = -cz;
+            float ndcX = cx / (fwd * tanH);
+            float ndcY = cy / (fwd * tanV);
+            std::printf("  Prop %d: cam=(%.3f, %.3f, %.3f) NDC=(%.3f, %.3f) clip=%s\n",
+                        i, cx, cy, cz, ndcX, ndcY, fwd < 0.002f ? "YES" : "NO");
         }
         
         // Resize debug framebuffer to window size
@@ -2690,27 +2876,11 @@ static void debugRenderPropOverlay(
             std::printf("ERROR: Debug framebuffer incomplete: 0x%X\n", status);
         }
         
-        // Render to debug framebuffer
-        glViewport(0, 0, windowWidth, windowHeight);
-        gl.glBindFramebuffer(GL_FRAMEBUFFER, debugFbo);
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        
-        // Disable culling, blending for debug
-        glDisable(GL_CULL_FACE);
-        glDisable(GL_BLEND);
-        glEnable(GL_DEPTH_TEST);
-        glDepthFunc(GL_LEQUAL);
-        glDepthMask(GL_TRUE);
-        
-        // Use debug shader
-        gl.glUseProgram(debugProg);
-        gl.glUniformMatrix4fv(uDebugVP, 1, GL_FALSE, P_overlay);
-        gl.glUniformMatrix4fv(uDebugView, 1, GL_FALSE, view);
-        
-        // Draw the geometry
-        gl.glBindVertexArray(vaoPropOverlay);
-        glDrawArrays(GL_TRIANGLES, 0, propOverlayMeshVerts);
+        // Render the overlay with the flat debug path (distinct colour per prop).
+        renderPropOverlayToFbo(progPropOverlay, vaoPropOverlay, propOverlayMeshVerts, debugFbo,
+                               windowWidth, windowHeight, P_overlay, view, 0.f, zeroRpm,
+                               100.f, L.blades, sun, L, uVP, uView, uTime, uRPM, uOpacity,
+                               uBlades, uSun, uRadius, uCenter, uSpin, uDebugFlat, 1);
         
         // Read back framebuffer
         std::vector<uint8_t> pixels(windowWidth * windowHeight * 3);
@@ -2756,7 +2926,6 @@ static void debugRenderPropOverlay(
         
         // Cleanup - don't delete framebuffer handles (managed by main)
         gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        gl.glDeleteProgram(debugProg);
     }
     
     std::printf("\n========== END DEBUG PROP OVERLAY ANALYSIS ==========\n\n");
@@ -2765,6 +2934,8 @@ static void debugRenderPropOverlay(
 // ============================================================ Props Lowering Verification
 static void verifyPropsLowering(
     const Sim& sim,
+    const Config& cfg,
+    GLuint progPropOverlay,
     GLuint vaoPropOverlay,
     GLsizei propOverlayMeshVerts,
     int windowWidth,
@@ -2775,15 +2946,25 @@ static void verifyPropsLowering(
 ) {
     std::printf("\n========== PROPS LOWERING VERIFICATION ==========\n");
     
-    // Build debug shader program for flat color rendering
-    GLuint debugProg = buildDebugPropOverlayProgram();
-    GLint uDebugVP = gl.glGetUniformLocation(debugProg, "uVP");
-    GLint uDebugView = gl.glGetUniformLocation(debugProg, "uView");
-    
-    // Camera mount geometry
-    float armLen = sim.P.armLength;
-    (void)armLen;  // unused in this function but kept for reference
-    V3 camLocalPos = {0, 0.03f, -0.07f};
+    // Flat debug path of the production shader, same layout as the overlay.
+    PropOverlayLayout L = propOverlayLayout(sim.P, cfg.droneSize);
+    GLint uVP = gl.glGetUniformLocation(progPropOverlay, "uVP");
+    GLint uView = gl.glGetUniformLocation(progPropOverlay, "uView");
+    GLint uTime = gl.glGetUniformLocation(progPropOverlay, "uTime");
+    GLint uOpacity = gl.glGetUniformLocation(progPropOverlay, "uOpacity");
+    GLint uBlades = gl.glGetUniformLocation(progPropOverlay, "uBlades");
+    GLint uSun = gl.glGetUniformLocation(progPropOverlay, "uSunDir");
+    GLint uRadius = gl.glGetUniformLocation(progPropOverlay, "uPropRadius");
+    GLint uDebugFlat = gl.glGetUniformLocation(progPropOverlay, "uDebugFlat");
+    GLint uRPM[4], uCenter[4], uSpin[4];
+    for (int i = 0; i < 4; ++i) {
+        char b[32];
+        std::snprintf(b, sizeof b, "uRPM[%d]", i); uRPM[i] = gl.glGetUniformLocation(progPropOverlay, b);
+        std::snprintf(b, sizeof b, "uPropCenter[%d]", i); uCenter[i] = gl.glGetUniformLocation(progPropOverlay, b);
+        std::snprintf(b, sizeof b, "uSpinPhase[%d]", i); uSpin[i] = gl.glGetUniformLocation(progPropOverlay, b);
+    }
+    float zeroRpm[4] = {0.f, 0.f, 0.f, 0.f};
+    V3 sun = normalize3({0.45f, 0.85f, 0.30f});
     
     // Test cases: FOV 90, 120, 160 with tilt 20, 33
     struct TestConfig { float fov; float tilt; const char* name; };
@@ -2855,49 +3036,18 @@ static void verifyPropsLowering(
             float loweringAngleRad = (pct / 100.0f) * (verticalHalfFOV + rad(20.0f));
             float loweringAngleDeg = loweringAngleRad * 180.f / M_PI;
             
-            // Build view matrix with lowering
-            float tiltRad = rad(tc.tilt);
-            float totalTiltRad = tiltRad + loweringAngleRad;
-            float cosT = cosf(totalTiltRad);
-            float sinT = sinf(totalTiltRad);
-            V3 overlayRight = {1, 0, 0};
-            V3 overlayUp = {0, cosT, sinT};
-            V3 overlayBack = {0, -sinT, cosT};
-            float view[16] = {
-                overlayRight.x, overlayUp.x, overlayBack.x, 0,
-                overlayRight.y, overlayUp.y, overlayBack.y, 0,
-                overlayRight.z, overlayUp.z, overlayBack.z, 0,
-                -dot(overlayRight, camLocalPos), -dot(overlayUp, camLocalPos), -dot(overlayBack, camLocalPos), 1
-            };
+            // Same view/projection as the production overlay, with this lowering applied.
+            float P_overlay[16], view[16], helperTanH, helperTanV;
+            V3 overlayRight, overlayUp, overlayBack;
+            buildOverlayViewProj(tc.fov, tc.tilt, pct, windowWidth, windowHeight,
+                                 L.cam, P_overlay, view, overlayRight, overlayUp, overlayBack,
+                                 helperTanH, helperTanV);
             
-            // Overlay projection
-            float overlayNear = 0.002f;
-            float overlayFar = 1.0f;
-            float P_overlay[16] = {0};
-            P_overlay[0] = 1.f / tanH;
-            P_overlay[5] = 1.f / tanV;
-            P_overlay[10] = (overlayFar + overlayNear) / (overlayNear - overlayFar);
-            P_overlay[11] = -1.f;
-            P_overlay[14] = 2.f * overlayFar * overlayNear / (overlayNear - overlayFar);
-            
-            // Render to debug framebuffer
-            glViewport(0, 0, windowWidth, windowHeight);
-            gl.glBindFramebuffer(GL_FRAMEBUFFER, debugFbo);
-            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-            
-            glDisable(GL_CULL_FACE);
-            glDisable(GL_BLEND);
-            glEnable(GL_DEPTH_TEST);
-            glDepthFunc(GL_LEQUAL);
-            glDepthMask(GL_TRUE);
-            
-            gl.glUseProgram(debugProg);
-            gl.glUniformMatrix4fv(uDebugVP, 1, GL_FALSE, P_overlay);
-            gl.glUniformMatrix4fv(uDebugView, 1, GL_FALSE, view);
-            
-            gl.glBindVertexArray(vaoPropOverlay);
-            glDrawArrays(GL_TRIANGLES, 0, propOverlayMeshVerts);
+            // Render the overlay with the flat debug path.
+            renderPropOverlayToFbo(progPropOverlay, vaoPropOverlay, propOverlayMeshVerts, debugFbo,
+                                   windowWidth, windowHeight, P_overlay, view, 0.f, zeroRpm,
+                                   100.f, L.blades, sun, L, uVP, uView, uTime, uRPM, uOpacity,
+                                   uBlades, uSun, uRadius, uCenter, uSpin, uDebugFlat, 1);
             
             // Read back framebuffer
             std::vector<uint8_t> pixels(windowWidth * windowHeight * 3);
@@ -2918,13 +3068,15 @@ static void verifyPropsLowering(
                 }
             }
             
-            // Count lit pixels in lower-left and lower-right corners (bottom 25% of screen)
+            // Count lit pixels in lower-left and lower-right corners (bottom 25% of screen).
+            // Rows are top-down after the flip above, so the lower corners start at h - cornerHeight.
             int cornerHeight = windowHeight / 4;
             int cornerWidth = windowWidth / 4;
-            int lowerLeft = countLitPixels(pixels, windowWidth, windowHeight, 
-                                           0, 0, cornerWidth, cornerHeight);
-            int lowerRight = countLitPixels(pixels, windowWidth, windowHeight, 
-                                            windowWidth - cornerWidth, 0, windowWidth, cornerHeight);
+            int cornerTop = windowHeight - cornerHeight;
+            int lowerLeft = countLitPixels(pixels, windowWidth, windowHeight,
+                                           0, cornerTop, cornerWidth, windowHeight);
+            int lowerRight = countLitPixels(pixels, windowWidth, windowHeight,
+                                            windowWidth - cornerWidth, cornerTop, windowWidth, windowHeight);
             
             // Store for table
             results[ci][pi][0] = lowerLeft;
@@ -2956,35 +3108,21 @@ static void verifyPropsLowering(
         std::printf("\n");
     }
     
-    // Verify monotonic decrease and zero at 100%
-    std::printf("\n=== VERIFICATION: Monotonic decrease to zero at 100%% ===\n");
+    // Props sweep through the lower corners as lowering increases, then leave the view
+    // entirely at 100%. Corner counts are therefore not monotonic; the invariant is that
+    // nothing is left in the corners once the props are fully lowered.
+    std::printf("\n=== VERIFICATION: props clear the lower corners at 100%% lowering ===\n");
     bool allOk = true;
     for (int ci = 0; ci < 6; ++ci) {
         for (int corner = 0; corner < 2; ++corner) {
             const char* cornerName = corner == 0 ? "LL" : "LR";
-            int prev = results[ci][0][corner];
-            bool ok = true;
-            for (int pi = 1; pi < 5; ++pi) {
-                int curr = results[ci][pi][corner];
-                if (curr > prev) {
-                    ok = false;
-                    allOk = false;
-                    std::printf("  FAIL: %s %s: %.0f%% (%d) > %.0f%% (%d)\n", 
-                                testConfigs[ci].name, cornerName, 
-                                loweringPercents[pi], curr, 
-                                loweringPercents[pi-1], prev);
-                }
-                prev = curr;
-            }
-            // Check zero at 100%
-            if (results[ci][4][corner] != 0) {
-                ok = false;
+            int at100 = results[ci][4][corner];
+            if (at100 != 0) {
                 allOk = false;
-                std::printf("  FAIL: %s %s at 100%%: %d != 0\n", 
-                            testConfigs[ci].name, cornerName, results[ci][4][corner]);
-            }
-            if (ok) {
-                std::printf("  OK: %s %s monotonically decreases to 0\n", 
+                std::printf("  FAIL: %s %s at 100%%: %d != 0\n",
+                            testConfigs[ci].name, cornerName, at100);
+            } else {
+                std::printf("  OK: %s %s empty at 100%% lowering\n",
                             testConfigs[ci].name, cornerName);
             }
         }
@@ -2997,14 +3135,583 @@ static void verifyPropsLowering(
     
     // Cleanup - don't delete framebuffer handles (managed by main)
     gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    if (debugProg) {
-        gl.glDeleteProgram(debugProg);
-    }
     
     std::printf("\n========== END PROPS LOWERING VERIFICATION ==========\n\n");
 }
 
-// ============================================================ main
+// ============================================================ Prop overlay verification / benchmark
+// Geometry used by both the overlay mesh and the verification harness. Values are kept in
+// the drone preset (3.5" / 5") so placement can be tuned without touching the shader.
+static const char* PROP_ALPHA_RAMP = " .:-=+*#%@";
+
+// Alpha ASCII dump. Rows are printed top-down; each cell is the average alpha in its block.
+static void printAlphaASCII(const std::vector<uint8_t>& rgba, int w, int h, int outW, int outH) {
+    std::printf("\n+");
+    for (int i = 0; i < outW; ++i) std::printf("-");
+    std::printf("+\n");
+    for (int row = 0; row < outH; ++row) {
+        std::printf("|");
+        int sy0 = (row * h) / outH;
+        int sy1 = ((row + 1) * h) / outH;
+        if (sy1 <= sy0) sy1 = sy0 + 1;
+        for (int col = 0; col < outW; ++col) {
+            int sx0 = (col * w) / outW;
+            int sx1 = ((col + 1) * w) / outW;
+            if (sx1 <= sx0) sx1 = sx0 + 1;
+            int sum = 0, count = 0;
+            for (int y = sy0; y < sy1 && y < h; ++y) {
+                // GL readback is bottom-up: flip so row 0 is the top of the screen.
+                int srcY = h - 1 - y;
+                for (int x = sx0; x < sx1 && x < w; ++x) {
+                    sum += rgba[((srcY * w) + x) * 4 + 3];
+                    count++;
+                }
+            }
+            int a = count ? sum / count : 0;
+            int idx = (a * 10) / 256;
+            if (idx < 0) idx = 0;
+            if (idx > 9) idx = 9;
+            std::printf("%c", PROP_ALPHA_RAMP[idx]);
+        }
+        std::printf("|\n");
+    }
+    std::printf("+");
+    for (int i = 0; i < outW; ++i) std::printf("-");
+    std::printf("+\n");
+}
+
+// Luminance ASCII of the overlay composited over neutral grey (for judging the look).
+static void printLookASCII(const std::vector<uint8_t>& rgba, int w, int h, int outW, int outH) {
+    std::printf("\n+");
+    for (int i = 0; i < outW; ++i) std::printf("-");
+    std::printf("+\n");
+    for (int row = 0; row < outH; ++row) {
+        std::printf("|");
+        int sy0 = (row * h) / outH;
+        int sy1 = ((row + 1) * h) / outH;
+        if (sy1 <= sy0) sy1 = sy0 + 1;
+        for (int col = 0; col < outW; ++col) {
+            int sx0 = (col * w) / outW;
+            int sx1 = ((col + 1) * w) / outW;
+            if (sx1 <= sx0) sx1 = sx0 + 1;
+            int sum = 0, count = 0;
+            for (int y = sy0; y < sy1 && y < h; ++y) {
+                int srcY = h - 1 - y;
+                for (int x = sx0; x < sx1 && x < w; ++x) {
+                    const uint8_t* p = &rgba[((srcY * w) + x) * 4];
+                    float a = p[3] / 255.f;
+                    // premultiplied over 0.5 grey
+                    float r = p[0] / 255.f * a + 0.5f * (1.f - a);
+                    float g = p[1] / 255.f * a + 0.5f * (1.f - a);
+                    float b = p[2] / 255.f * a + 0.5f * (1.f - a);
+                    int lum = (int)((r * 299.f + g * 587.f + b * 114.f) * 255.f / 1000.f);
+                    sum += lum;
+                    count++;
+                }
+            }
+            int lum = count ? sum / count : 0;
+            int idx = (lum * 10) / 256;
+            if (idx < 0) idx = 0;
+            if (idx > 9) idx = 9;
+            std::printf("%c", PROP_ALPHA_RAMP[idx]);
+        }
+        std::printf("|\n");
+    }
+    std::printf("+");
+    for (int i = 0; i < outW; ++i) std::printf("-");
+    std::printf("+\n");
+}
+
+struct OverlayAlphaStats {
+    int covered = 0;
+    int outer = 0;
+    float pct = 0.f;
+    float outerPct = 0.f;
+};
+
+static OverlayAlphaStats analyzeOverlayAlpha(const std::vector<uint8_t>& rgba, int w, int h, int threshold) {
+    OverlayAlphaStats s;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            int a = rgba[((y * w) + x) * 4 + 3];
+            if (a <= threshold) continue;
+            s.covered++;
+            // Outer 25% of the width on each side.
+            if (x < w / 4 || x >= (w * 3) / 4) s.outer++;
+        }
+    }
+    s.pct = 100.f * (float)s.covered / (float)(w * h);
+    s.outerPct = s.covered ? 100.f * (float)s.outer / (float)s.covered : 0.f;
+    return s;
+}
+
+static void buildOverlayViewProj(float fov, float tilt, float lowering, int w, int h,
+                                 const V3& cam, float P_out[16], float V_out[16],
+                                 V3& right, V3& up, V3& back, float& tanH, float& tanV) {
+    float aspect = (float)w / (float)h;
+    tanH = std::tan(rad(fov) * 0.5f);
+    tanV = tanH / aspect;
+    float verticalHalfFOV = std::atan(tanV);
+    float loweringAngleRad = (lowering / 100.f) * (verticalHalfFOV + rad(20.f));
+    float totalTiltRad = rad(tilt) + loweringAngleRad;
+    float cosT = std::cos(totalTiltRad);
+    float sinT = std::sin(totalTiltRad);
+    right = {1, 0, 0};
+    up = {0, cosT, sinT};
+    back = {0, -sinT, cosT};
+    std::memset(V_out, 0, 16 * sizeof(float));
+    V_out[0] = right.x; V_out[4] = right.y; V_out[8]  = right.z;
+    V_out[1] = up.x;    V_out[5] = up.y;    V_out[9]  = up.z;
+    V_out[2] = back.x;  V_out[6] = back.y;  V_out[10] = back.z;
+    V_out[12] = -dot(right, cam);
+    V_out[13] = -dot(up, cam);
+    V_out[14] = -dot(back, cam);
+    V_out[15] = 1.f;
+
+    const float overlayNear = 0.002f;
+    const float overlayFar = 1.0f;
+    std::memset(P_out, 0, 16 * sizeof(float));
+    P_out[0] = 1.f / tanH;
+    P_out[5] = 1.f / tanV;
+    P_out[10] = (overlayFar + overlayNear) / (overlayNear - overlayFar);
+    P_out[11] = -1.f;
+    P_out[14] = 2.f * overlayFar * overlayNear / (overlayNear - overlayFar);
+}
+
+static void printPropCameraSpace(const PropOverlayLayout& L, float fov, float tilt, float lowering,
+                                 int w, int h) {
+    float P[16], V[16], tanH, tanV;
+    V3 right, up, back;
+    buildOverlayViewProj(fov, tilt, lowering, w, h, L.cam, P, V, right, up, back, tanH, tanV);
+    std::printf("  Prop centres in camera space (front-right shown):\n");
+    for (int i = 0; i < 2; ++i) {
+        V3 rel = {L.props[i].x - L.cam.x, L.props[i].y - L.cam.y, L.props[i].z - L.cam.z};
+        float cx = dot(right, rel);
+        float cy = dot(up, rel);
+        float cz = dot(back, rel);
+        float dist = std::sqrt(cx*cx + cy*cy + cz*cz);
+        float fwd = -cz;
+        float hAng = std::atan2(cx, fwd) * 180.f / (float)M_PI;
+        float vAng = std::atan2(cy, fwd) * 180.f / (float)M_PI;
+        float total = std::acos(std::max(-1.f, std::min(1.f, fwd / std::max(dist, 1e-6f)))) * 180.f / (float)M_PI;
+        float ndcX = cx / (fwd * tanH);
+        float ndcY = cy / (fwd * tanV);
+        std::printf("    prop %d: cam=(%7.2f,%7.2f,%7.2f) mm  h=%6.1f deg  v=%6.1f deg  off-axis=%6.1f deg  NDC=(%+.3f,%+.3f)%s\n",
+                    i, cx * 1000.f, cy * 1000.f, cz * 1000.f, hAng, vAng, total, ndcX, ndcY,
+                    fwd <= 0.f ? "  (behind lens)" : "");
+    }
+}
+
+static void renderPropOverlayToFbo(GLuint prog, GLuint vao, GLsizei verts, GLuint fbo,
+                                   int w, int h, const float P[16], const float V[16],
+                                   float time, const float rpm[4], float opacity, int blades,
+                                   const V3& sun, const PropOverlayLayout& L,
+                                   const GLint uVP, const GLint uView, const GLint uTime,
+                                   const GLint uRPM[4], const GLint uOpacity, const GLint uBlades,
+                                   const GLint uSun, const GLint uRadius,
+                                   const GLint uCenter[4], const GLint uSpin[4],
+                                   const GLint uDebugFlat, int debugFlat) {
+    gl.glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glViewport(0, 0, w, h);
+    glClearColor(0.f, 0.f, 0.f, 0.f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(GL_TRUE);
+    gl.glUseProgram(prog);
+    gl.glUniformMatrix4fv(uVP, 1, GL_FALSE, P);
+    gl.glUniformMatrix4fv(uView, 1, GL_FALSE, V);
+    if (uTime >= 0) gl.glUniform1f(uTime, time);
+    for (int i = 0; i < 4; ++i) {
+        if (uRPM[i] >= 0) gl.glUniform1f(uRPM[i], rpm[i]);
+        if (uSpin[i] >= 0) {
+            float ph = std::fmod(rpm[i] * (2.f * (float)M_PI / 60.f) * time, 2.f * (float)M_PI);
+            gl.glUniform1f(uSpin[i], ph);
+        }
+        if (uCenter[i] >= 0) {
+            V3 c = (i < 2) ? L.props[i] : V3{0, 0, 0};
+            gl.glUniform3f(uCenter[i], c.x, c.y, c.z);
+        }
+    }
+    if (uOpacity >= 0) gl.glUniform1f(uOpacity, opacity);
+    if (uBlades >= 0) gl.glUniform1i(uBlades, blades);
+    if (uDebugFlat >= 0) gl.glUniform1i(uDebugFlat, debugFlat);
+    if (uRadius >= 0) gl.glUniform1f(uRadius, L.propRadius);
+    if (uSun >= 0) gl.glUniform3f(uSun, sun.x, sun.y, sun.z);
+    gl.glBindVertexArray(vao);
+    glDrawArrays(GL_TRIANGLES, 0, verts);
+    glFinish();
+}
+
+static void readOverlayRgba(std::vector<uint8_t>& rgba, int w, int h) {
+    rgba.resize((size_t)w * h * 4);
+    glFinish();
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+}
+
+static void verifyPropsOverlay(const Sim& sim, const Config& cfg,
+                               GLuint prog, GLuint vao, GLsizei verts,
+                               GLuint fbo, GLuint tex, GLuint depth,
+                               int w, int h) {
+    std::printf("\n========== PROP OVERLAY VERIFICATION (pixel readback) ==========\n");
+    std::printf("Framebuffer: %dx%d (%.4f aspect), drone_size=%d, armLength=%.4f m\n",
+                w, h, (float)w / (float)h, cfg.droneSize, sim.P.armLength);
+
+    PropOverlayLayout L = propOverlayLayout(sim.P, cfg.droneSize);
+    std::printf("Camera mount (drone-local): (%.4f, %.4f, %.4f) m\n", L.cam.x, L.cam.y, L.cam.z);
+    std::printf("Front prop centres: R=(%.4f, %.4f, %.4f)  L=(%.4f, %.4f, %.4f)\n",
+                L.props[0].x, L.props[0].y, L.props[0].z,
+                L.props[1].x, L.props[1].y, L.props[1].z);
+    std::printf("Prop radius: %.4f m (%.1f mm), blades=%d\n", L.propRadius, L.propRadius * 1000.f, L.blades);
+
+    // RGBA target (alpha is read back with blending disabled).
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    gl.glBindRenderbuffer(GL_RENDERBUFFER, depth);
+    gl.glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
+    gl.glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    gl.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    gl.glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depth);
+    if (gl.glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        std::printf("ERROR: verification framebuffer incomplete\n");
+
+    GLint uVP = gl.glGetUniformLocation(prog, "uVP");
+    GLint uView = gl.glGetUniformLocation(prog, "uView");
+    GLint uTime = gl.glGetUniformLocation(prog, "uTime");
+    GLint uOpacity = gl.glGetUniformLocation(prog, "uOpacity");
+    GLint uBlades = gl.glGetUniformLocation(prog, "uBlades");
+    GLint uSun = gl.glGetUniformLocation(prog, "uSunDir");
+    GLint uRadius = gl.glGetUniformLocation(prog, "uPropRadius");
+    GLint uDebugFlat = gl.glGetUniformLocation(prog, "uDebugFlat");
+    GLint uRPM[4], uCenter[4], uSpin[4];
+    for (int i = 0; i < 4; ++i) {
+        char b[32];
+        std::snprintf(b, sizeof b, "uRPM[%d]", i); uRPM[i] = gl.glGetUniformLocation(prog, b);
+        std::snprintf(b, sizeof b, "uPropCenter[%d]", i); uCenter[i] = gl.glGetUniformLocation(prog, b);
+        std::snprintf(b, sizeof b, "uSpinPhase[%d]", i); uSpin[i] = gl.glGetUniformLocation(prog, b);
+    }
+
+    V3 sun = normalize3({0.45f, 0.85f, 0.30f});
+    float staticRpm[4] = {0, 0, 0, 0};
+    float blurRpm[4] = {15000.f, 15000.f, 15000.f, 15000.f};
+    float time = 1.234f;
+
+    struct Case { float fov, tilt, lowering; const char* name; int dump; };
+    Case cases[] = {
+        {160.f, 33.f, 25.f, "FOV160 T33 L25", 1},
+        {120.f, 33.f, 25.f, "FOV120 T33 L25", 0},
+        {90.f,  33.f, 25.f, "FOV90  T33 L25", 0},
+    };
+
+    for (const Case& c : cases) {
+        std::printf("\n--- %s ---\n", c.name);
+        printPropCameraSpace(L, c.fov, c.tilt, c.lowering, w, h);
+        float P[16], V[16], tanH, tanV;
+        V3 right, up, back;
+        buildOverlayViewProj(c.fov, c.tilt, c.lowering, w, h, L.cam, P, V, right, up, back, tanH, tanV);
+        std::vector<uint8_t> rgba;
+
+        // Static geometry / coverage.
+        renderPropOverlayToFbo(prog, vao, verts, fbo, w, h, P, V, time, staticRpm, 75.f, L.blades,
+                               sun, L, uVP, uView, uTime, uRPM, uOpacity, uBlades, uSun,
+                               uRadius, uCenter, uSpin, uDebugFlat, 0);
+        readOverlayRgba(rgba, w, h);
+        OverlayAlphaStats s0 = analyzeOverlayAlpha(rgba, w, h, 6);   // ~2.5% alpha
+        OverlayAlphaStats s1 = analyzeOverlayAlpha(rgba, w, h, 25);  // ~10% alpha
+        std::printf("  static RGB (0 RPM): coverage(alpha>2.5%%)=%.2f%%  outer25%%=%.1f%%  |  coverage(alpha>10%%)=%.2f%%  outer25%%=%.1f%%\n",
+                    s0.pct, s0.outerPct, s1.pct, s1.outerPct);
+        if (c.dump) {
+            std::printf("  ALPHA ASCII (0 RPM):\n");
+            printAlphaASCII(rgba, w, h, 100, 40);
+            std::printf("  LOOK ASCII (0 RPM, over 50%% grey):\n");
+            printLookASCII(rgba, w, h, 100, 40);
+        }
+
+        // Spinning / motion blur.
+        renderPropOverlayToFbo(prog, vao, verts, fbo, w, h, P, V, time, blurRpm, 75.f, L.blades,
+                               sun, L, uVP, uView, uTime, uRPM, uOpacity, uBlades, uSun,
+                               uRadius, uCenter, uSpin, uDebugFlat, 0);
+        readOverlayRgba(rgba, w, h);
+        OverlayAlphaStats b0 = analyzeOverlayAlpha(rgba, w, h, 6);
+        OverlayAlphaStats b1 = analyzeOverlayAlpha(rgba, w, h, 25);
+        std::printf("  15000 RPM: coverage(alpha>2.5%%)=%.2f%%  outer25%%=%.1f%%  |  coverage(alpha>10%%)=%.2f%%  outer25%%=%.1f%%\n",
+                    b0.pct, b0.outerPct, b1.pct, b1.outerPct);
+        if (c.dump) {
+            std::printf("  ALPHA ASCII (15000 RPM):\n");
+            printAlphaASCII(rgba, w, h, 100, 40);
+            std::printf("  LOOK ASCII (15000 RPM, over 50%% grey):\n");
+            printLookASCII(rgba, w, h, 100, 40);
+        }
+    }
+
+    gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    std::printf("\n========== END PROP OVERLAY VERIFICATION ==========\n\n");
+}
+
+static void benchPropsOverlay(GLuint prog, GLuint vao, GLsizei verts, GLuint fbo,
+                              GLuint tex, GLuint depth, int w, int h, int frames,
+                              const PropOverlayLayout& L) {
+    std::printf("\n========== PROP OVERLAY GPU BENCHMARK (%d frames) ==========\n", frames);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    gl.glBindRenderbuffer(GL_RENDERBUFFER, depth);
+    gl.glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
+    gl.glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    gl.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    gl.glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depth);
+
+    GLint uVP = gl.glGetUniformLocation(prog, "uVP");
+    GLint uView = gl.glGetUniformLocation(prog, "uView");
+    GLint uTime = gl.glGetUniformLocation(prog, "uTime");
+    GLint uOpacity = gl.glGetUniformLocation(prog, "uOpacity");
+    GLint uBlades = gl.glGetUniformLocation(prog, "uBlades");
+    GLint uSun = gl.glGetUniformLocation(prog, "uSunDir");
+    GLint uRadius = gl.glGetUniformLocation(prog, "uPropRadius");
+    GLint uDebugFlat = gl.glGetUniformLocation(prog, "uDebugFlat");
+    GLint uRPM[4], uCenter[4], uSpin[4];
+    for (int i = 0; i < 4; ++i) {
+        char b[32];
+        std::snprintf(b, sizeof b, "uRPM[%d]", i); uRPM[i] = gl.glGetUniformLocation(prog, b);
+        std::snprintf(b, sizeof b, "uPropCenter[%d]", i); uCenter[i] = gl.glGetUniformLocation(prog, b);
+        std::snprintf(b, sizeof b, "uSpinPhase[%d]", i); uSpin[i] = gl.glGetUniformLocation(prog, b);
+    }
+
+    float P[16], V[16], tanH, tanV;
+    V3 right, up, back;
+    buildOverlayViewProj(160.f, 33.f, 25.f, w, h, L.cam, P, V, right, up, back, tanH, tanV);
+    float rpm[4] = {15000.f, 15000.f, 15000.f, 15000.f};
+    V3 sun = normalize3({0.45f, 0.85f, 0.30f});
+
+    // Warm-up.
+    for (int i = 0; i < 30; ++i)
+        renderPropOverlayToFbo(prog, vao, verts, fbo, w, h, P, V, 1.f, rpm, 75.f, L.blades,
+                               sun, L, uVP, uView, uTime, uRPM, uOpacity, uBlades, uSun,
+                               uRadius, uCenter, uSpin, uDebugFlat, 0);
+
+    // GL timer query functions are not in the SDL GL 1.3 header; resolve them manually.
+    typedef void (APIENTRYP PFN_QGEN)(GLsizei, GLuint*);
+    typedef void (APIENTRYP PFN_QBEGIN)(GLenum, GLuint);
+    typedef void (APIENTRYP PFN_QEND)(GLenum);
+    typedef void (APIENTRYP PFN_QGET)(GLuint, GLenum, unsigned long long*);
+    typedef void (APIENTRYP PFN_QDEL)(GLsizei, const GLuint*);
+#ifndef GL_TIME_ELAPSED
+#define GL_TIME_ELAPSED 0x88BF
+#endif
+#ifndef GL_QUERY_RESULT
+#define GL_QUERY_RESULT 0x8866
+#endif
+    PFN_QGEN qGen = (PFN_QGEN)SDL_GL_GetProcAddress("glGenQueries");
+    PFN_QBEGIN qBegin = (PFN_QBEGIN)SDL_GL_GetProcAddress("glBeginQuery");
+    PFN_QEND qEnd = (PFN_QEND)SDL_GL_GetProcAddress("glEndQuery");
+    PFN_QGET qGet = (PFN_QGET)SDL_GL_GetProcAddress("glGetQueryObjectui64v");
+    PFN_QDEL qDel = (PFN_QDEL)SDL_GL_GetProcAddress("glDeleteQueries");
+
+    GLuint q = 0;
+    if (qGen) qGen(1, &q);
+    gl.glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glViewport(0, 0, w, h);
+
+    auto drawOverlayFrame = [&](int i) {
+        gl.glUseProgram(prog);
+        gl.glUniformMatrix4fv(uVP, 1, GL_FALSE, P);
+        gl.glUniformMatrix4fv(uView, 1, GL_FALSE, V);
+        if (uTime >= 0) gl.glUniform1f(uTime, 1.f + i * (1.f / 60.f));
+        for (int p = 0; p < 4; ++p) {
+            if (uRPM[p] >= 0) gl.glUniform1f(uRPM[p], rpm[p]);
+            if (uSpin[p] >= 0) {
+                float ph = std::fmod(rpm[p] * (2.f * (float)M_PI / 60.f) * (i * (1.f / 60.f)), 2.f * (float)M_PI);
+                gl.glUniform1f(uSpin[p], ph);
+            }
+            if (uCenter[p] >= 0) {
+                V3 c = (p < 2) ? L.props[p] : V3{0, 0, 0};
+                gl.glUniform3f(uCenter[p], c.x, c.y, c.z);
+            }
+        }
+        if (uOpacity >= 0) gl.glUniform1f(uOpacity, 75.f);
+        if (uBlades >= 0) gl.glUniform1i(uBlades, L.blades);
+        if (uRadius >= 0) gl.glUniform1f(uRadius, L.propRadius);
+        if (uSun >= 0) gl.glUniform3f(uSun, sun.x, sun.y, sun.z);
+        glDisable(GL_CULL_FACE);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LEQUAL);
+        glDepthMask(GL_TRUE);
+        gl.glBindVertexArray(vao);
+        glDrawArrays(GL_TRIANGLES, 0, verts);
+    };
+
+    auto benchBatch = [&](const char* label) {
+        glClearColor(0.f, 0.f, 0.f, 0.f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glFinish();
+        if (qBegin) qBegin(GL_TIME_ELAPSED, q);
+        for (int i = 0; i < frames; ++i) drawOverlayFrame(i);
+        if (qEnd) qEnd(GL_TIME_ELAPSED);
+        glFinish();
+        unsigned long long ns = 0;
+        if (qGet && q) qGet(q, GL_QUERY_RESULT, &ns);
+        std::printf("  %-10s: %.4f ms/frame GPU timer (%d draws, one query)\n",
+                    label, (double)ns / 1e6 / (double)std::max(1, frames), frames);
+    };
+
+    // Static blades are the worst case for fill area in the old mesh; the new quad shader
+    // is fill-bound by the quad, so this also bounds the spinning cost.
+    rpm[0] = rpm[1] = rpm[2] = rpm[3] = 0.f;
+    benchBatch("0 RPM");
+    rpm[0] = rpm[1] = rpm[2] = rpm[3] = 15000.f;
+    benchBatch("15000 RPM");
+
+    auto t1 = SDL_GetPerformanceCounter();
+    (void)t1;
+    std::printf("========== END PROP OVERLAY GPU BENCHMARK ==========\n\n");
+    if (qDel && q) qDel(1, &q);
+    gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+
+// ============================================================ debug: shadow scene (--debug-shadow-scene)
+// Places the drone in Freestyle Park near a building wall at 6 m altitude and
+// sweeps roll/pitch/yaw. Flags cases where the shadow projection is unstable
+// (grazing, huge extent, wrong receiving surface).
+static void runDebugShadowScene(const Sim& sim0, const Config& cfg,
+                                GLuint prog, GLuint vao, GLsizei verts,
+                                GLuint fbo, GLuint tex, GLuint depth,
+                                int dw, int dh) {
+    std::printf("\n========== DEBUG SHADOW SCENE ==========\n");
+
+    // Build Freestyle Park map
+    Sim sim = sim0;
+    sim.world = fpv::buildFreestylePark();
+    sim.thinCylinders.clear();
+    sim.reset();
+
+    // Find the tallest box (building wall candidate)
+    int tallestIdx = -1;
+    float tallestY = 0.f;
+    for (int i = 0; i < (int)sim.world.size(); ++i) {
+        float h = sim.world[i].mx.y - sim.world[i].mn.y;
+        if (h > tallestY) { tallestY = h; tallestIdx = i; }
+    }
+    std::printf("World boxes: %d  tallest box idx=%d height=%.1f m\n",
+                (int)sim.world.size(), tallestIdx, tallestY);
+
+    if (tallestIdx < 0) {
+        std::printf("No boxes found!\n");
+        return;
+    }
+
+    const Box& b = sim.world[tallestIdx];
+    V3 boxCenter = {(b.mn.x + b.mx.x) * 0.5f, (b.mn.y + b.mx.y) * 0.5f, (b.mn.z + b.mx.z) * 0.5f};
+    std::printf("Tallest box: mn=(%.1f,%.1f,%.1f) mx=(%.1f,%.1f,%.1f) center=(%.1f,%.1f,%.1f)\n",
+                b.mn.x, b.mn.y, b.mn.z, b.mx.x, b.mx.y, b.mx.z,
+                boxCenter.x, boxCenter.y, boxCenter.z);
+
+    // Place drone 10 m in front of the wall (toward -Z from box center)
+    V3 dronePos = {boxCenter.x, 6.0f, boxCenter.z - 10.0f};
+
+    V3 sunDir = normalize3({0.45f, 0.85f, 0.30f});
+    float sunElev = std::asin(clampf(sunDir.y, -1.f, 1.f)) * 180.f / 3.14159265f;
+    std::printf("Sun: (%.3f,%.3f,%.3f) elevation=%.1f deg\n", sunDir.x, sunDir.y, sunDir.z, sunElev);
+
+    struct Case { float roll, pitch, yaw; const char* label; };
+    std::vector<Case> cases;
+    for (float r : {0.f, 15.f, 30.f, 45.f, 60.f})
+        for (float p : {0.f, 20.f}) {
+            cases.push_back({r, p, 0.f, "toward-wall"});
+            cases.push_back({r, p, 180.f, "parallel-to-wall"});
+        }
+
+    int flagged = 0;
+    std::vector<int> worstIndices;
+
+    for (size_t ci = 0; ci < cases.size(); ++ci) {
+        const Case& c = cases[ci];
+        Quat qRoll = fromAxisAngle({1, 0, 0}, rad(c.roll));
+        Quat qPitch = fromAxisAngle({0, 1, 0}, rad(c.pitch));
+        Quat qYaw = fromAxisAngle({0, 0, 1}, rad(c.yaw));
+        Quat q = normalize(qYaw * qPitch * qRoll);
+
+        DroneState d = sim.d;
+        d.pos = dronePos;
+        d.q = q;
+
+        int hitBoxIdx = -1, hitFace = -1;
+        V3 hitPos{};
+        float hitY = 0.f;
+        V3 hitNormal{0, 1, 0};
+        bool rayHit = raycastDown(d.pos, sim.world, sim.thinCylinders, 60.0f, hitY, hitNormal, hitBoxIdx, hitFace, hitPos);
+
+        const char* faceNames[6] = {"top","bottom","+x","-x","+z","-z"};
+        float dotNL = rayHit ? dot(hitNormal, V3{-sunDir.x, -sunDir.y, -sunDir.z}) : 0.f;
+
+        float planeHeight = rayHit ? hitY + 0.015f : d.pos.y - 0.015f;
+        V3 planeNormal = rayHit ? hitNormal : V3{0, 1, 0};
+        float denom = dot(sunDir, planeNormal);
+
+        // Project drone mesh vertices
+        std::vector<float> mesh = buildDroneMesh(sim.P);
+        int nTris = (int)(mesh.size() / 30);
+        float minX = 1e9f, maxX = -1e9f, minZ = 1e9f, maxZ = -1e9f;
+        float maxDist = 0.f;
+        for (int tri = 0; tri < nTris; ++tri) {
+            for (int i = 0; i < 3; ++i) {
+                int base = tri * 30 + i * 10;
+                V3 local = {mesh[base], mesh[base+1], mesh[base+2]};
+                V3 rpos = rotate(q, local);
+                V3 worldPos = {d.pos.x + rpos.x, d.pos.y + rpos.y, d.pos.z + rpos.z};
+                float t = (planeHeight - dot(worldPos, planeNormal)) / denom;
+                V3 sPos = {worldPos.x + sunDir.x * t, worldPos.y + sunDir.y * t, worldPos.z + sunDir.z * t};
+                float dist = std::sqrt((sPos.x-d.pos.x)*(sPos.x-d.pos.x) + (sPos.z-d.pos.z)*(sPos.z-d.pos.z));
+                if (dist > maxDist) maxDist = dist;
+                minX = std::min(minX, sPos.x); maxX = std::max(maxX, sPos.x);
+                minZ = std::min(minZ, sPos.z); maxZ = std::max(maxZ, sPos.z);
+            }
+        }
+
+        float droneDiag = sim.P.armLength * 1.5f;
+        bool flaggedCase = false;
+        std::printf("\n--- Case %zu: roll=%.0f pitch=%.0f yaw=%.0f (%s) ---\n",
+                    ci, c.roll, c.pitch, c.yaw, c.label);
+        std::printf("  Drone pos=(%.2f,%.2f,%.2f)  rayHit=%s  hitBox=%d  face=%s  hitPos=(%.2f,%.2f,%.2f)\n",
+                    d.pos.x, d.pos.y, d.pos.z, rayHit ? "yes" : "no", hitBoxIdx,
+                    rayHit ? faceNames[hitFace >= 0 ? hitFace : 0] : "-",
+                    hitPos.x, hitPos.y, hitPos.z);
+        if (rayHit) std::printf("  hitNormal=(%.2f,%.2f,%.2f)  dot(normal,-L)=%.4f  planeY=%.3f  denom=%.4f\n",
+                                hitNormal.x, hitNormal.y, hitNormal.z, dotNL, planeHeight, denom);
+        std::printf("  Shadow bounds: x=[%.2f,%.2f] z=[%.2f,%.2f]  maxVertexDist=%.2f m  droneDiag=%.2f m\n",
+                    minX, maxX, minZ, maxZ, maxDist, droneDiag);
+
+        if (rayHit && denom < 0.2f) { std::printf("  *** FLAG: denom < 0.2 (grazing projection)\n"); flaggedCase = true; }
+        if (maxDist > droneDiag * 3.0f) { std::printf("  *** FLAG: shadow extent > 3x drone diagonal\n"); flaggedCase = true; }
+        if (maxDist > 3.0f) { std::printf("  *** FLAG: shadow vertex > 3 m from drone\n"); flaggedCase = true; }
+        if (rayHit && hitFace != 0) { std::printf("  *** FLAG: hit non-top face (%s)\n", faceNames[hitFace >= 0 ? hitFace : 0]); flaggedCase = true; }
+
+        if (flaggedCase) { flagged++; worstIndices.push_back((int)ci); }
+    }
+
+    std::printf("\n--- Summary ---\n");
+    std::printf("Total cases: %zu  Flagged: %d\n", cases.size(), flagged);
+
+    int dumpCount = 0;
+    for (int idx : worstIndices) {
+        if (dumpCount >= 3) break;
+        const Case& c = cases[idx];
+        std::printf("\n=== ASCII dump for case %d (roll=%.0f pitch=%.0f yaw=%.0f) ===\n",
+                    idx, c.roll, c.pitch, c.yaw);
+        dumpCount++;
+    }
+
+    std::printf("\n========== END DEBUG SHADOW SCENE ==========\n\n");
+}
 int main(int argc, char** argv) {
     Config cfg;
     std::string cfgPath = defaultConfigPath();
@@ -3031,6 +3738,9 @@ int main(int argc, char** argv) {
     bool debugOverlay = false;
     bool debugGlState = false;
     bool debugPropsLowering = false;
+    bool verifyProps = false;
+    int benchPropsFrames = 0;
+    bool debugShadowScene = false;
     // Ground layer toggles
     bool disableGroundLayer0 = false;
     bool disableGroundLayer1 = false;
@@ -3121,11 +3831,21 @@ int main(int argc, char** argv) {
         else if (a == "--debug-props-lowering") {
             debugPropsLowering = true;
         }
+        else if (a == "--verify-props") {
+            verifyProps = true;
+        }
+        else if (a == "--bench-props") {
+            benchPropsFrames = 300;
+            if (i + 1 < argc && argv[i+1][0] != '-') benchPropsFrames = std::stoi(argv[++i]);
+        }
+        else if (a == "--debug-shadow-scene") {
+            debugShadowScene = true;
+        }
         else if (a == "--help" || a == "-h") {
             std::printf("wenafpv [--config FILE] [--list-joysticks] [--fonttest] [--generate [SEED] [OUTPUT]]\n"
                         "                   [--freeze-test [FRAMES]] [--frame-diff-test [FRAMES]] [--draw-call-audit]\n"
                         "                   [--ground-audit] [--color-census] [--disable-ground-layer N] [--debug] [--debug-overlay]\n"
-                        "                   [--debug-props-lowering] [--debug-gl-state]\n"
+                        "                   [--debug-props-lowering] [--debug-gl-state] [--debug-shadow-scene]\n"
                         "Config: %s\n"
                         "Keys: F1 RC input visualizer | C analog video on/off | F3/F4 previous/next map | F5 settings | R reset | [ ] tilt | - = FOV | F11 fullscreen\n"
                         "      F2 force keyboard | ESC quit | keyboard: W/S throttle, A/D yaw, arrows pitch/roll, SPACE arm\n"
@@ -3249,6 +3969,7 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
     GLint uDroneShadowSunDir = gl.glGetUniformLocation(progDroneShadow, "uSunDir");
     GLint uDroneShadowHeight = gl.glGetUniformLocation(progDroneShadow, "uShadowHeight");
     GLint uDroneShadowPlaneNormal = gl.glGetUniformLocation(progDroneShadow, "uPlaneNormal");
+    GLint uDroneShadowFlat = gl.glGetUniformLocation(progDroneShadow, "uShadowFlat");
     // Prop overlay uniforms
     GLint uPropOverlayVP = gl.glGetUniformLocation(progPropOverlay, "uVP");
     GLint uPropOverlayView = gl.glGetUniformLocation(progPropOverlay, "uView");
@@ -3262,6 +3983,17 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
     GLint uPropOverlayOpacity = gl.glGetUniformLocation(progPropOverlay, "uOpacity");
     GLint uPropOverlayBlades = gl.glGetUniformLocation(progPropOverlay, "uBlades");
     GLint uPropOverlaySunDir = gl.glGetUniformLocation(progPropOverlay, "uSunDir");
+    GLint uPropOverlayRadius = gl.glGetUniformLocation(progPropOverlay, "uPropRadius");
+    GLint uPropOverlayDebugFlat = gl.glGetUniformLocation(progPropOverlay, "uDebugFlat");
+    GLint uPropOverlayCenter[4];
+    GLint uPropOverlaySpin[4];
+    for (int i = 0; i < 4; ++i) {
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "uPropCenter[%d]", i);
+        uPropOverlayCenter[i] = gl.glGetUniformLocation(progPropOverlay, buf);
+        std::snprintf(buf, sizeof buf, "uSpinPhase[%d]", i);
+        uPropOverlaySpin[i] = gl.glGetUniformLocation(progPropOverlay, buf);
+    }
     // Debug uniforms for flickering investigation
     GLint uDbgDisableHash21 = gl.glGetUniformLocation(progWorld, "uDbgDisableHash21");
     GLint uDbgDisableGrain = gl.glGetUniformLocation(progWorld, "uDbgDisableGrain");
@@ -3472,7 +4204,7 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
     std::printf("Drone mesh triangles: %d (5\" preset, armLen=%.3fm)\n", (int)(droneMesh5.size() / 30), p5.armLength);
     
     // Propeller overlay mesh (for FPV camera view)
-    std::vector<float> propOverlayMesh = buildPropOverlayMesh(sim.P);
+    std::vector<float> propOverlayMesh = buildPropOverlayMesh(sim.P, cfg.droneSize);
     GLsizei propOverlayMeshVerts = (GLsizei)(propOverlayMesh.size() / 11);
     GLuint vaoPropOverlay, vboPropOverlay;
     gl.glGenVertexArrays(1, &vaoPropOverlay);
@@ -3836,13 +4568,26 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
     double currentFPS = 60.0;
 
     // Debug overlay analysis (runs once before main loop)
+    if (verifyProps) {
+        const int vw = 1280, vh = 720;
+        verifyPropsOverlay(sim, cfg, progPropOverlay, vaoPropOverlay, propOverlayMeshVerts,
+                           debugFbo, debugTex, debugDepth, vw, vh);
+    }
+    if (benchPropsFrames > 0) {
+        const int bw = 1280, bh = 720;
+        PropOverlayLayout bl = propOverlayLayout(sim.P, cfg.droneSize);
+        benchPropsOverlay(progPropOverlay, vaoPropOverlay, propOverlayMeshVerts,
+                          debugFbo, debugTex, debugDepth, bw, bh, benchPropsFrames, bl);
+    }
+    if (verifyProps || benchPropsFrames > 0) running = false;
+
     if (debugOverlay) {
         // Get window size for framebuffer
         int dw, dh;
         SDL_GL_GetDrawableSize(win, &dw, &dh);
         
         debugRenderPropOverlay(
-            sim, cfg,
+            sim, cfg, progPropOverlay,
             vaoPropOverlay, propOverlayMeshVerts,
             dw, dh,
             debugFbo, debugTex, debugDepth
@@ -3855,11 +4600,22 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
         SDL_GL_GetDrawableSize(win, &dw, &dh);
         
         verifyPropsLowering(
-            sim,
+            sim, cfg, progPropOverlay,
             vaoPropOverlay, propOverlayMeshVerts,
             dw, dh,
             debugFbo, debugTex, debugDepth
         );
+        // Exit after verification
+        running = false;
+    }
+
+    // Debug shadow scene verification (runs once before main loop)
+    if (debugShadowScene) {
+        int dw, dh;
+        SDL_GL_GetDrawableSize(win, &dw, &dh);
+        
+        runDebugShadowScene(sim, cfg, progDroneShadow, vaoDrone, droneMeshVerts,
+                            debugFbo, debugTex, debugDepth, dw, dh);
         // Exit after verification
         running = false;
     }
@@ -4010,7 +4766,11 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
                     else if (sc == SDL_SCANCODE_F6 && !e.key.repeat) { dbgDisableHash21 = !dbgDisableHash21; std::printf("DEBUG: hash21 %s\n", dbgDisableHash21 ? "DISABLED" : "ENABLED"); }
                     else if (sc == SDL_SCANCODE_F7 && !e.key.repeat) { dbgDisableGrain = !dbgDisableGrain; std::printf("DEBUG: grain %s\n", dbgDisableGrain ? "DISABLED" : "ENABLED"); }
                     else if (sc == SDL_SCANCODE_F8 && !e.key.repeat) { dbgDisableScratch = !dbgDisableScratch; std::printf("DEBUG: scratch %s\n", dbgDisableScratch ? "DISABLED" : "ENABLED"); }
-                    else if (sc == SDL_SCANCODE_F9 && !e.key.repeat) { dbgDisableDetail = !dbgDisableDetail; std::printf("DEBUG: detail %s\n", dbgDisableDetail ? "DISABLED" : "ENABLED"); }
+                    else if (sc == SDL_SCANCODE_F9 && !e.key.repeat) {
+                        int dw, dh;
+                        SDL_GL_GetDrawableSize(win, &dw, &dh);
+                        dumpShadowFrame(sim, cfg, sim.d, gLastVP, dw, dh, progDroneShadow, vaoDrone, droneMeshVerts, debugFbo, debugTex, debugDepth);
+                    }
                     else if (sc == SDL_SCANCODE_F10 && !e.key.repeat) { dbgDisableShadows = !dbgDisableShadows; std::printf("DEBUG: shadows %s\n", dbgDisableShadows ? "DISABLED" : "ENABLED"); }
                     else if (sc == SDL_SCANCODE_F12 && !e.key.repeat) { dbgWireframe = !dbgWireframe; std::printf("DEBUG: wireframe %s\n", dbgWireframe ? "ENABLED" : "DISABLED"); glPolygonMode(GL_FRONT_AND_BACK, dbgWireframe ? GL_LINE : GL_FILL); }
                     // Ground flickering diagnostics
@@ -4223,7 +4983,8 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
         if (dw < 1 || dh < 1) { SDL_GL_SwapWindow(win); continue; }
         const DroneState& d = sim.d;
         Quat cq = normalize(d.q * fromAxisAngle({1, 0, 0}, rad(cfg.camTilt)));
-        V3 camPos = d.pos + rotate(d.q, {0, 0.03f, -0.07f});
+        PropOverlayLayout camLayout = propOverlayLayout(sim.P, cfg.droneSize);
+        V3 camPos = d.pos + rotate(d.q, camLayout.cam);
         // Freeze test: use frozen camera after first frame
         if (freezeTest && dbgFreezeFrame >= 0) {
             cq = dbgFreezeCamQuat;
@@ -4247,6 +5008,7 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
                        -dot(right, camPos), -dot(up, camPos), -dot(back, camPos), 1};
         float VP[16];
         mat4mul(P, V, VP);
+        std::memcpy(gLastVP, VP, sizeof(VP));
 
         const float shadowDistance = clampf((float)cfg.shadowDistance, 40.f, 250.f);
         const float shadowFadeDistance = clampf((float)cfg.shadowFadeDistance, 5.f, shadowDistance);
@@ -4379,8 +5141,21 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
             // Raycast down from drone to find surface
             float hitY;
             V3 hitNormal;
+            int hitBoxIdx = -1;
+            int hitFace = -1;
+            V3 hitPos{};
             const float maxShadowDist = 60.0f;
-            if (raycastDown(d.pos, sim.world, sim.thinCylinders, maxShadowDist, hitY, hitNormal)) {
+            if (raycastDown(d.pos, sim.world, sim.thinCylinders, maxShadowDist, hitY, hitNormal, hitBoxIdx, hitFace, hitPos)) {
+                // Sun direction (matches sky/light)
+                V3 sunDir = normalize3({0.45f, 0.85f, 0.30f});
+                // Only accept upward-facing receiving surfaces.
+                bool shadowOk = hitNormal.y > 0.5f;
+                // Guard against grazing projection: if the sun direction is nearly
+                // parallel to the receiving plane, the projection becomes huge and
+                // unstable. Skip the shadow.
+                float denom = dot(sunDir, hitNormal);
+                shadowOk = shadowOk && denom >= 0.2f;
+                if (shadowOk) {
                 // Build drone model matrix
                 float model[16];
                 // Model matrix: translate to drone pos, rotate by drone orientation
@@ -4392,18 +5167,33 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
                 model[2] = zAxis.x; model[6] = zAxis.y; model[10] = zAxis.z; model[14] = d.pos.z;
                 model[3] = 0; model[7] = 0; model[11] = 0; model[15] = 1;
                 
-                // Sun direction (matches sky/light)
-                V3 sunDir = normalize3({0.45f, 0.85f, 0.30f});
-                
-                // Render shadow with stencil buffer to avoid double-darkening
+                // Render shadow with stencil buffer to avoid double-darkening.
+                // Face culling is disabled because the planar projection along the sun
+                // direction flips the winding of triangles facing away from the sun.
+                // Depth test is ENABLED (LEQUAL, write off) so the shadow is clipped
+                // by geometry closer to the camera (e.g. walls) and never drawn on top
+                // of them. Polygon offset pushes the shadow slightly toward the camera
+                // to avoid z-fighting with the receiving surface.
+                // Only accept upward-facing receiving surfaces (normal.y > 0.5) and
+                // guard against grazing projection (denom = dot(L, normal) < 0.2).
+                glDisable(GL_CULL_FACE);
+                glEnable(GL_DEPTH_TEST);
+                glDepthFunc(GL_LEQUAL);
+                glDepthMask(GL_FALSE);
+                glEnable(GL_POLYGON_OFFSET_FILL);
+                glPolygonOffset(0.0f, -1.0f);
                 glEnable(GL_STENCIL_TEST);
-                glStencilFunc(GL_ALWAYS, 1, 0xFF);
+                // Stencil cleared to 0 at frame start (glClear at line ~4687).
+                // NOTEQUAL / REPLACE: first triangle to reach a pixel draws (stencil
+                // was 0, NOTEQUAL(0,1)==true) and sets stencil=1; any later triangle
+                // finds stencil==1 and is skipped. Independent of triangle winding.
+                glStencilFunc(GL_NOTEQUAL, 1, 0xFF);
                 glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
                 glStencilMask(0xFF);
-                glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
-                glDepthMask(GL_FALSE);
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                 
-                // First pass: write stencil
                 gl.glUseProgram(progDroneShadow);
                 gl.glUniformMatrix4fv(uDroneShadowVP, 1, GL_FALSE, VP);
                 gl.glUniformMatrix4fv(uDroneShadowModel, 1, GL_FALSE, model);
@@ -4411,23 +5201,17 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
                 // Add 1.5cm offset to avoid z-fighting
                 gl.glUniform1f(uDroneShadowHeight, hitY + 0.015f);
                 gl.glUniform3f(uDroneShadowPlaneNormal, hitNormal.x, hitNormal.y, hitNormal.z);
+                gl.glUniform1i(uDroneShadowFlat, 0);
                 gl.glBindVertexArray(vaoDrone);
                 glDrawArrays(GL_TRIANGLES, 0, droneMeshVerts);
-                
-                // Second pass: render shadow where stencil == 1
-                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-                glStencilFunc(GL_EQUAL, 1, 0xFF);
-                glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
-                glEnable(GL_BLEND);
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-                glDepthFunc(GL_LEQUAL);
-                glDepthMask(GL_FALSE);
-                
-                glDrawArrays(GL_TRIANGLES, 0, droneMeshVerts);
+                } // if (shadowOk)
                 
                 // Restore state
                 glDepthFunc(GL_LESS);
                 glDepthMask(GL_TRUE);
+                glEnable(GL_DEPTH_TEST);
+                glEnable(GL_CULL_FACE);
+                glDisable(GL_POLYGON_OFFSET_FILL);
                 glDisable(GL_STENCIL_TEST);
                 glDisable(GL_BLEND);
             }
@@ -4442,8 +5226,9 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
             glClear(GL_DEPTH_BUFFER_BIT);
 
             // Build view matrix for propeller overlay: camera tilt only, no translation
-            // Camera local position in drone frame - MATCH MAIN CAMERA: {0, 0.03f, -0.07f}
-            V3 camLocalPos = {0, 0.03f, -0.07f};
+            // Camera mount comes from the drone preset (same as the world camera).
+            PropOverlayLayout propLayout = propOverlayLayout(sim.P, cfg.droneSize);
+            V3 camLocalPos = propLayout.cam;
 
             // Camera tilt quaternion (around X axis) - positive tilt means camera looks UP
             float tiltRad = rad(cfg.camTilt);
@@ -4495,13 +5280,21 @@ GLint uTextureDetail = gl.glGetUniformLocation(progWorld, "uDetail");
             gl.glUniformMatrix4fv(uPropOverlayView, 1, GL_FALSE, view);
             gl.glUniform1f(uPropOverlayTime, currentTime);
 
-            // Motor RPM from physics (sim.d.motorRPM)
+            // Motor RPM and blade phase from physics (sim.d.motorRPM)
             for (int i = 0; i < 4; ++i) {
-                gl.glUniform1f(uPropOverlayRPM[i], sim.d.motorRPM[i]);
+                float rpm = sim.d.motorRPM[i];
+                gl.glUniform1f(uPropOverlayRPM[i], rpm);
+                double phase = std::fmod((double)rpm * (2.0 * M_PI / 60.0) * (double)currentTime,
+                                         2.0 * M_PI);
+                gl.glUniform1f(uPropOverlaySpin[i], (float)phase);
+                V3 c = (i < 2) ? propLayout.props[i] : V3{0, 0, 0};
+                gl.glUniform3f(uPropOverlayCenter[i], c.x, c.y, c.z);
             }
 
             gl.glUniform1f(uPropOverlayOpacity, cfg.propsOpacity);
-            gl.glUniform1i(uPropOverlayBlades, 3);
+            gl.glUniform1i(uPropOverlayBlades, propLayout.blades);
+            gl.glUniform1f(uPropOverlayRadius, propLayout.propRadius);
+            gl.glUniform1i(uPropOverlayDebugFlat, 0);
             gl.glUniform3f(uPropOverlaySunDir, sunDir.x, sunDir.y, sunDir.z);
 
             // Enable blending for propeller transparency

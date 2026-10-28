@@ -26,6 +26,27 @@
 - Fixed "double free or corruption" crash in `glGenFramebuffers` by creating debug framebuffers during main initialization
 - Fixed segfault in `glReadPixels` by adding `glFinish()` + `glPixelStorei(GL_PACK_ALIGNMENT, 1)`
 
+### Feature: Procedural Prop Overlay
+
+**What changed:**
+- Replaced the per-blade overlay meshes with one quad per front prop (two-sided, no culling, alpha blended)
+- `PROP_OVERLAY_FS` now draws the blades procedurally in polar coordinates: tapered rounded tip, hub,
+  `fwidth` anti-aliasing, and analytic angular motion blur (1/240 s exposure, capped at blade pitch)
+- Blade shading is a mid-grey carbon tone with a bright edge sheen, tuned to read against both sky and ground
+- Prop spin is applied analytically via `uSpinPhase[4]`; vertices no longer rotate around the drone origin
+- New shared `propOverlayLayout()` places the camera mount and prop centres per preset
+  (3.5": 27.0 mm forward / 28.5 mm high; 5": 40.0 mm forward / 29.0 mm high, 3 blades)
+- Front arms/motors remain in the overlay and keep the existing lit shading
+
+**Verification (`--verify-props`, 1280×720, FOV160 / tilt 33 / lowering 25%):**
+- 3.5": prop centre NDC `(+1.03, −0.87)`, coverage 4.04%, 88.5% of overlay pixels in the outer 25% bands
+- 5": prop centre NDC `(+0.99, −0.76)`, coverage 4.03%, 89.8% outer
+- FOV120 and FOV90: 0% coverage (props fully outside the frame)
+- `--bench-props 300` GL timer query: 0.133 ms/frame on Intel HD 520 (target <0.3 ms)
+
+**Props lowering debug check:** corner counts are now region-correct after the vertical flip; the check
+reports that props clear the lower corners at 100% lowering instead of expecting monotonic counts.
+
 ---
 
 ## v1.1.5_ALPHA
