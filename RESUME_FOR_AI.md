@@ -71,11 +71,6 @@ All training-specific game mechanics have been stripped out:
 - **`abandoned_base_seed`** config option in QUALITY tab (F5), full uint32 range, persists to config.ini
 - Default seed: `0xDEADBEEF` (3735928559)
 
-#### Shadow Rendering Fixes (main.cpp)
-- **Tight near/far planes** for shadow orthographic projection: depth range reduced from ~600m to ~90m based on actual geometry height extents (ground thickness + max object altitude)
-- **Increased defaults**: `shadowBias` 0.00025→0.001, `shadowNormalOffset` 0.025→0.05
-- **Disabled `shadowStableSnapping` for mapIndex 4 (Abandoned Base)** — its 50m speed corridor at 100+ km/h caused texel snapping to flicker between frames; other maps retain it
-
 #### HUD Positioning (main.cpp)
 - **VID quality HUD** moved from top-right to upper-left, directly under battery MAH display
 
@@ -139,7 +134,7 @@ fpvsim-working/
 │   └── video.hpp      # Analog video signal system (FPV interference effects)
 ├── tests/
 │   └── physics_test.cpp  # 48 headless physics tests
-├── Makefile           # Build: wenafpv, test, install (sudo-safe), clean
+├── Makefile           # Build: wenafpv, test, install, clean
 ├── README.md          # User documentation
 ├── UPDATES.md         # Change log (physics fix for spurious lift)
 ├── RESUME_FOR_AI.md   # AI context resume
@@ -156,13 +151,11 @@ fpvsim-working/
 - ✅ Level file loads correctly (boxes, thin, spawn, markers)
 - ✅ F5 reloads level file on abandoned base map
 - ✅ Abandoned base seed setting persists in config.ini
-- ✅ Shadow rendering fixes: no blinking on Abandoned Base map
 - ✅ VID HUD positioned correctly under battery MAH
 - ✅ Texture randomization applied to all 5 maps
 - ✅ Props lowering setting works, persists, verified with `--debug-props-lowering`
 - ✅ Procedural prop overlay verified with `--verify-props` (pixel readback + ASCII dumps; FOV120/90 keep props out of frame)
 - ✅ Overlay GPU cost measured with `--bench-props 300`: ≤0.17 ms/frame on HD 520 (target <0.3 ms)
-- ✅ `make clean && sudo make install` works; the install rule hands the root-built binary back to the invoking user (`chown $SUDO_USER`), so the next normal `make` doesn't hit permission errors
 
 ---
 
@@ -264,7 +257,7 @@ Key settings:
 # Benchmark the overlay's GPU cost (batched GL timer query, N draws per run)
 ./wenafpv --bench-props 300
 
-# Build from scratch and install to /usr (binary ownership is fixed back to the invoking user)
+# Build from scratch and install to /usr
 make clean && sudo make install
 ```
 

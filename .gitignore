@@ -23,4 +23,5 @@ pkg/
 src.zip
 
 # AI helper files (personal reference, not for repo)
+# DO NOT REMOVE: GIT_UPLOAD_AI_HELP.md must stay ignored permanently.
 GIT_UPLOAD_AI_HELP.md
